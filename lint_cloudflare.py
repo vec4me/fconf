@@ -1,16 +1,16 @@
 # Cloudflare Linter by Jeffrey Skinner <jeff@je.gy> a.k.a. blocksrey
 # I should do patching instead of deleting everything and rewriting.
 
-API_TOKEN = "PauifCWEbEo7RJehPHQ7t9xuMYE93LNPwNpy5Q-b"
 ACCOUNT_ID = "a1de4b4bea97ddf530554ad8b89a6ace"
-URL_LINTER_WORKER_NAME = "forward" # Forward was not a good name. LOL
+API_TOKEN = "PauifCWEbEo7RJehPHQ7t9xuMYE93LNPwNpy5Q-b"
 MAILCHANNELS_ID = "truckee00"
-
-get_length = len
+URL_LINTER_WORKER_NAME = "forward" # Forward was not a good name. LOL
+VPS = "5.78.116.190"
 
 import requests
 import json
 import re
+import Levenshtein
 
 ADDRESS = "A"
 WILD = "*"
@@ -23,10 +23,8 @@ ROOT = "@"
 TEXT = "TXT"
 WWW = "www"
 GATEWAY = "1.1.1.1"
-VPS = "5.78.116.190"
 AUTO = 1
 RESPECT_HEADERS = 0 # Apparently 0 is the equivalent of "respect headers."
-GOOGLE_SITE_VERIFICATION = "google-site-verification=BwEFkZFAZLbcyX6mlw0Azb-aZTIsf11vanr6UX6_lX4"
 ONE_DAY = 86400
 ONE_WEEK = 604800
 TWO_HOURS = 7200
@@ -49,8 +47,15 @@ def perform(type, url, json = None):
 	else:
 		print(f"{response.json()["errors"][0]["message"]}: {url}")
 
-def get_69_zones():
-	return perform("get", "zones?per_page=69")
+def get_zones():
+	zones = []
+	page = 1
+	while (data := perform("get", f"zones?per_page=69&page={page}")):
+		zones.extend(data)
+		if len(data) < 69:
+			break
+		page += 1
+	return zones
 
 def get_records(zone):
 	records = perform("get", f"zones/{zone["id"]}/dns_records")
@@ -59,26 +64,27 @@ def get_records(zone):
 			record["name"] = ROOT
 		elif record["name"].endswith(f".{zone["name"]}"):
 			record["name"] = record["name"][0:-(1 + len(zone["name"]))]
+		if quoted(record["content"]):
+			record["content"] = unquote(record["content"])
 	return records
 
-def get_formatted_record(record):
-	return f"{record["zone_name"]}'s record [{record["type"]}, {record["name"]}, {record["content"]}]"
-
 def delete_record(record):
-	print(f"Delete {get_formatted_record(record)}")
-	perform("delete", f"zones/{record["zone_id"]}/dns_records/{record["id"]}")
+	if perform("delete", f"zones/{record["zone_id"]}/dns_records/{record["id"]}"):
+		print(f"Delete {record["zone_name"]}'s record [{record["type"]}, {record["name"]}, {record["content"]}]")
 
 def get_settings(zone):
 	return perform("get", f"zones/{zone["id"]}/settings")
 
-def do_spf_records(zone):
+def delete_spf_records(zone):
 	records = get_records(zone)
 	for record in records:
 		if "v=spf1" in record["content"]:
 			delete_record(record)
-	url = f"zones/{zone["id"]}/dns_records"
-	# "ttl": ONE_DAY, # https://community.cloudflare.com/t/adding-an-spf-record-to-our-dns/538913
-	create_record(zone, TEXT, ROOT, "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com include:relay.mailchannels.net ~all")
+
+def do_spf_records(zone):
+	delete_spf_records(zone)
+	# create_record(zone, ROOT, "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com include:relay.mailchannels.net ~all")
+	create_record(zone, ROOT, "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com ~all")
 
 override_levels = {}
 
@@ -138,7 +144,6 @@ override_levels["security_header"] = {"strict_transport_security": {"enabled": F
 override_levels["ciphers"] = []
 
 def add_redirect(zone, url0, url1):
-	print(f"Add rule {url0} -> {url1} to {zone["name"]}")
 	payload_as_json = {
 		"targets": [
 			{
@@ -161,12 +166,13 @@ def add_redirect(zone, url0, url1):
 		"priority": 1, # LMAO
 		"status": "active"
 	}
-	perform("post", f"zones/{zone["id"]}/pagerules", payload_as_json)
+	if perform("post", f"zones/{zone["id"]}/pagerules", payload_as_json):
+		print(f"Add rule {url0} -> {url1} to {zone["name"]}")
 
 def delete_page_rule(zone, rule):
-	print(f"Delete rule {rule} from {zone["name"]}")
 	url = f"zones/{zone["id"]}/pagerules/{rule["id"]}"
-	perform("delete", url)
+	if perform("delete", url):
+		print(f"Delete rule {rule} from {zone["name"]}")
 
 def get_page_rules(zone):
 	url = f"zones/{zone["id"]}/pagerules"
@@ -182,28 +188,34 @@ def delete_page_rules(zone):
 def do_page_rules(zone):
 	delete_page_rules(zone)
 
-	if zone["name"] == "blocksrey.com":
-		add_redirect(zone, f"https://www.{zone["name"]}/", f"https://www.{zone["name"]}/index.htm")
-		add_redirect(zone, f"https://www.{zone["name"]}/?*", f"https://www.{zone["name"]}/index.htm")
+	primary, secondary = get_web_pair(zone["name"])
+	# This fixes the Instagram redirect thing.
+	add_redirect(zone, f"https://{primary}/fbclid*", f"https://{primary}/")
+
+	if brr_derivative(zone):
+		add_redirect(zone, f"https://{primary}/*", f"https://www.bestratereview.com/$1")
+		add_redirect(zone, f"https://{secondary}/*", f"https://www.bestratereview.com/$1")
+	elif zone["name"] == "blocksrey.com":
+		add_redirect(zone, f"https://{primary}/", f"https://{primary}/index.htm")
 	elif zone["name"] == "southtowntattoocollective.com":
 		add_redirect(zone, f"https://*southtowntattoocollective.com/*", f"https://$1tattoocollectivereno.com/$2") # This works for now.
 	else:
-		primary, secondary = get_web_pair(zone)
 		add_redirect(zone, f"https://{secondary}/*", f"https://{primary}/$1")
 
-def is_page_responding(domain):
+def page_responding(domain):
 	try:
-		requests.head(f"https://{domain}")
+		requests.head(f"https://{domain}/")
 		return True
 	except:
 		return False
 
-def create_page_domain_from_zone(zone, domain):
-	short_name = get_short_name(zone)
-	primary, secondary = get_web_pair(zone)
+def create_page_domains(zone):
+	short_name = get_short_name(zone["name"])
+	primary, secondary = get_web_pair(zone["name"])
 	for page in pages:
 		if page["name"] == short_name:
 			create_page_domain(page, primary)
+			create_page_domain(page, secondary)
 
 def do_web_records(zone):
 	delete_web_records(zone)
@@ -213,18 +225,24 @@ def do_web_records(zone):
 		revert = "southtowntattoocollective.com"
 		zone["name"] = "tattoocollectivereno.com"
 
-	domain = f"{get_short_name(zone)}.pages.dev"
-	if not is_page_responding(domain):
-		domain = VPS
-
-	if is_og(zone):
-		easy_create_record(zone, WWW, domain, PROXIED)
-		easy_create_record(zone, ROOT, domain, PROXIED)
+	domain = None
+	page_domain = find_page_domain(zone)
+	if page_domain:
+		domain = page_domain
 	else:
-		easy_create_record(zone, ROOT, domain, PROXIED)
-		easy_create_record(zone, WWW, domain, PROXIED)
+		if zone["name"] == "bestratereview.com":
+			domain = "35.192.114.80"
+		else:
+			domain = VPS
 
-	# create_page_domain_from_zone(zone, domain)
+	if get_og(zone["name"]):
+		create_record(zone, WWW, domain)
+		create_record(zone, ROOT, domain)
+	else:
+		create_record(zone, ROOT, domain)
+		create_record(zone, WWW, domain)
+
+	# create_page_domains(zone)
 
 	if revert:
 		zone["name"] = revert
@@ -241,8 +259,8 @@ def do_settings(zone):
 				payload_as_json = {
 					"value": override_level
 				}
-				print(f"{setting["id"]} = {setting["value"]} -> {payload_as_json["value"]}")
-				perform("patch", f"zones/{zone["id"]}/settings/{setting["id"]}", payload_as_json)
+				if perform("patch", f"zones/{zone["id"]}/settings/{setting["id"]}", payload_as_json):
+					print(f"{setting["id"]} = {setting["value"]} -> {payload_as_json["value"]}")
 		except:
 			print(f"Missing override {setting["id"]} = {setting["value"]}")
 	if True:
@@ -250,27 +268,22 @@ def do_settings(zone):
 		perform("patch", f"zones/{zone["id"]}/settings/origin_max_http_version", {"value": "1"})
 		perform("patch", f"zones/{zone["id"]}/url_normalization", {"scope": "incoming", "type": "rfc_3986"})
 
-def set_proxied(record, proxied):
+def proxy(record, proxied):
 	url = f"zones/{record["zone_id"]}/dns_records/{record["id"]}"
 	payload_as_json = {
-		"content": record["content"],
-		"name": record["name"],
-		"proxied": proxied,
-		"ttl": record["ttl"],
-		"type": record["type"]
+		"proxied": proxied
 	}
-	perform("post", url, payload_as_json)
+	perform("patch", url, payload_as_json)
 
 def quote_if_space(string):
 	if " " in string:
-		return f'"{string}"'
+		return quote(string)
 	return string
 
-def create_record(zone, type, name, content, proxied = UNPROXIED):
-	print(f"Create {zone["name"]}'s record [{type}, {name}, {content}]")
+def hard_create_record(zone, type, name, content, proxied = PROXIED):
 	# Prioritize zone name given that @ = zone name.
-	if name == ROOT:
-		name = zone["name"]
+	if name == zone["name"]:
+		print("You should be using @ for the name!")
 	url = f"zones/{zone["id"]}/dns_records"
 	payload_as_json = {
 		"content": quote_if_space(content),
@@ -279,55 +292,59 @@ def create_record(zone, type, name, content, proxied = UNPROXIED):
 		"ttl": AUTO,
 		"type": type
 	}
-	perform("post", url, payload_as_json)
+	if perform("post", url, payload_as_json):
+		print(f"Create {zone["name"]}'s record [{type}, {name}, {content}]")
 
-# This is not true in the general sense but should work for our use case.
-def is_ip_address(address):
-	return address.count(".") == 3
+def ipv4_address(string):
+	ipv4_regex = r'^(\d{1,3}\.){3}\d{1,3}$'
+	if not re.match(ipv4_regex, string):
+		return False
+	parts = string.split(".")
+	return all(0 <= int(part) <= 255 for part in parts)
 
-def easy_create_record(zone, name, content, proxied = UNPROXIED):
-	if is_ip_address(content):
-		create_record(zone, ADDRESS, name, content, proxied)
+def create_record(zone, name, content, proxied = PROXIED):
+	if ipv4_address(content):
+		hard_create_record(zone, ADDRESS, name, content, proxied)
 	elif contains_weird(content):
-		create_record(zone, TEXT, name, content, proxied)
+		hard_create_record(zone, TEXT, name, content, UNPROXIED)
 	else:
-		create_record(zone, CNAME, name, content, proxied)
+		hard_create_record(zone, CNAME, name, content, proxied)
 
 def do_fast_vps_record(zone):
 	print(f"Do fast VPS record {zone["name"]}")
 	# if zone["name"] != "je.gy":
-	# 	easy_create_record(zone, WWW, "pan.je.gy")
+	# 	create_record(zone, WWW, "pan.je.gy")
 	# else:
-		# create_record(zone, ADDRESS, ROOT, VPS) # Pan (Hetzner US)
-	# create_record(zone, ADDRESS, WILD, VPS) # Pan (Hetzner US)
-	# easy_create_record(zone, WILD, "fe46fb907541b3e9d66a6f721dc11258.serveo.net")
-	# create_record(zone, ADDRESS, WILD, VPS)
-	# easy_create_record(zone, WILD, f"{get_short_name(zone)}.pages.dev") # Pages
+		# create_record(zone, ROOT, VPS) # Pan (Hetzner US)
+	# create_record(zone, WILD, VPS) # Pan (Hetzner US)
+	# create_record(zone, WILD, "fe46fb907541b3e9d66a6f721dc11258.serveo.net")
+	# create_record(zone, WILD, VPS)
+	# create_record(zone, WILD, f"{get_short_name(zone["name"])}.pages.dev") # Pages
 
-def is_og(zone):
-	parts = zone["name"].split(".")
-	is_og = parts[1] == "com" or parts[1] == "net" or parts[1] == "org"
-	return is_og
+def get_og(zone_name):
+	parts = zone_name.split(".")
+	og = parts[1] == "com" or parts[1] == "net" or parts[1] == "org"
+	return og
 
-def get_short_name(zone):
-	is_og = is_og(zone)
-	parts = zone["name"].split(".")
-	short_name = is_og and parts[0] or zone["name"].replace(".", "")
+def get_short_name(zone_name):
+	og = get_og(zone_name)
+	parts = zone_name.split(".")
+	short_name = og and parts[0] or zone_name.replace(".", "")
 	return short_name
 
 def delete_web_records(zone):
 	records = get_records(zone)
 	for record in records:
-		if is_web(record):
+		if web(record):
 			delete_record(record)
 
-def is_web(record):
-	return (is_cname(record) or record["type"] == ADRESS) and (record["type"] == ROOT or record["type"] == WWW)
+def web(record):
+	return (record["type"] == CNAME or record["type"] == ADDRESS) and (record["name"] == ROOT or record["name"] == WWW)
 
-def get_web_pair(zone):
-	www = f"www.{zone["name"]}"
-	root = zone["name"]
-	if is_og(zone):
+def get_web_pair(zone_name):
+	www = f"www.{zone_name}"
+	root = zone_name
+	if get_og(zone_name):
 		return www, root
 	else:
 		return root, www
@@ -345,7 +362,7 @@ def do_cname_records(zone):
 		return
 
 	for record in records:
-		if is_web(record):
+		if web(record):
 			if record["type"] == WWW:
 				www = record
 				target = record["content"]
@@ -354,14 +371,14 @@ def do_cname_records(zone):
 				target = record["content"]
 
 	if not www and root:
-		easy_create_record(zone, WWW, root["content"])
+		create_record(zone, WWW, root["content"])
 		delete_record(root)
 		# print(f"Created www subs record for {record["zone_name"]}")
 	elif www and root and www["content"] != root["content"]:
 		# print(f"Subs are pointing to different targets for {record["zone_name"]}")
 		delete_record(root)
 	if not root and www:
-		easy_create_record(zone, record["zone_name"], target)
+		create_record(zone, record["zone_name"], target)
 		# print(f"{record["zone_name"]} is missing a root sub but has www")
 		pass
 
@@ -377,52 +394,49 @@ def delete_dev_records(zone):
 def do_dev_records(zone):
 	records = get_records(zone)
 	delete_dev_records(zone)
-	create_record(zone, ADDRESS, "dev", VPS, PROXIED)
-
-def Is(record, type):
-	return record["type"] == type
+	create_record(zone, "dev", VPS, PROXIED)
 
 # def delete_a_and_cname_records(records):
 # 	for record in records:
-# 		if record["type"] == ADDRESS or Is(record, CNAME)):
+# 		if record["type"] == ADDRESS or record["type"] == CNAME)):
 # 			delete_record(record)
 
 def delete_text_records(zone):
 	records = get_records(zone)
 	for record in records:
-		if Is(record, TEXT):
+		if record["type"] == TEXT:
 			delete_record(record)
 
 # def proxy_and_lint_records(records):
 # 	for record in records:
-# 		if record["type"] == ADRESS:
+# 		if record["type"] == ADDRESS:
 # 			if record["name"] == ROOT or record["name"] == WWW:
-# 				# set_proxied(record, PROXIED)
-# 				set_proxied(record, PROXIED) # We're gonna turn off proxying for now because it's faster.
+# 				# proxy(record, PROXIED)
+# 				proxy(record, PROXIED) # We're gonna turn off proxying for now because it's faster.
 # 			elif record["proxied"]:
-# 				set_proxied(record, UNPROXIED)
+# 				proxy(record, UNPROXIED)
 
 def do_world_records_and_proxy(zone):
 	records = get_records(zone)
 	for record in records:
-		if is_web(record):
-			if Is(record, ADDRESS):
-				set_proxied(record, PROXIED)
+		if web(record):
+			if record["type"] == ADDRESS:
+				proxy(record, PROXIED)
 
 def add_route(zone, script, pattern):
-	print(f"Add {zone["name"]}'s worker route {pattern}")
 	payload_as_json = {
 		"pattern": pattern,
 		"script": script
 	}
-	perform("post", f"zones/{zone["id"]}/workers/routes", payload_as_json)
+	if perform("post", f"zones/{zone["id"]}/workers/routes", payload_as_json):
+		print(f"Add {zone["name"]}'s worker route {pattern}")
 
 def get_routes(zone):
 	return perform("get", f"zones/{zone["id"]}/workers/routes")
 
 def delete_route(zone, route):
-	print(f"Delete {zone["name"]}'s worker route {route["pattern"]}")
-	perform("delete", f"zones/{zone["id"]}/workers/routes/{route["id"]}")
+	if perform("delete", f"zones/{zone["id"]}/workers/routes/{route["id"]}"):
+		print(f"Delete {zone["name"]}'s worker route {route["pattern"]}")
 
 def delete_api_routes(zone):
 	routes = get_routes(zone)
@@ -432,7 +446,7 @@ def delete_api_routes(zone):
 
 def do_api_routes(zone):
 	delete_api_routes(zone)
-	add_route(zone, get_short_name(zone), f"api.{zone["name"]}/")
+	add_route(zone, get_short_name(zone["name"]), f"api.{zone["name"]}/")
 
 def delete_wildcards(records):
 	for record in records:
@@ -441,12 +455,12 @@ def delete_wildcards(records):
 
 def delete_root_cname_records(records):
 	for record in records:
-		if record["type"] == ROOT and Is(record, CNAME):
+		if record["type"] == ROOT and record["type"] == CNAME:
 			delete_record(record)
 
 def delete_root_txt_records(records):
 	for record in records:
-		if record["type"] == ROOT and Is(record, TEXT):
+		if record["type"] == ROOT and record["type"] == TEXT:
 			delete_record(record)
 
 def delete_url_linter_routes(zone):
@@ -459,7 +473,7 @@ def do_url_linter_routes(zone):
 	delete_url_linter_routes(zone)
 
 	# Forward should really be called lint URL or something different.
-	if is_og(zone):
+	if get_og(zone["name"]):
 		add_route(zone, URL_LINTER_WORKER_NAME, f"www.{zone["name"]}/*")
 	else:
 		add_route(zone, URL_LINTER_WORKER_NAME, f"{zone["name"]}/*")
@@ -476,15 +490,23 @@ def delete_api_records(zone):
 
 def do_api_records(zone):
 	delete_api_records(zone)
-	easy_create_record(zone, "api", f"{get_short_name(zone)}.blocksrey.workers.dev", PROXIED)
+	create_record(zone, "api", f"{get_short_name(zone["name"])}.blocksrey.workers.dev")
 
 def get_pages():
-	return perform("get", f"accounts/{ACCOUNT_ID}/pages/projects")
+	pages = []
+	page = 1
+	while (data := perform("get", f"accounts/{ACCOUNT_ID}/pages/projects?page={page}")):
+		pages.extend(data)
+		if len(data) < 10:
+			break
+		page += 1
+	return pages
+
 
 def create_page_domain(page, domain):
 	url = f"accounts/{ACCOUNT_ID}/pages/projects/{page["name"]}/domains"
 	payload_as_json = {
-		"domains": [f"https://{domain}"]
+		"domains": [f"https://{domain}/"]
 	}
 	perform("post", url, payload_as_json)
 
@@ -499,42 +521,33 @@ def delete_page_domain(page_domain):
 
 def delete_page_domains(page):
 	page_domains = get_page_domains(page)
+	if page_domains == None:
+		return False
 	for page_domain in page_domains:
 		delete_page_domains(page_domain)
 
 # Make a function to lint URLs (ensure trailing slashes) on Pages, Workers, etc.
 
 def do_google_search_console_records(zone):
-	create_record(zone, TEXT, ROOT, GOOGLE_SITE_VERIFICATION)
+	create_record(zone, ROOT, GOOGLE_SITE_VERIFICATION)
 
-def autofy_records(zone):
-	records = get_records(zone)
-	for record in records:
-		if record["ttl"] != AUTO:
-			url = f"zones/{record["zone_id"]}/dns_records/{record["id"]}"
-			payload_as_json = {
-				"ttl": AUTO
-			}
-			perform("patch", url, payload_as_json)
-
-def proxify_records(zone, proxied = PROXIED):
-	records = get_records(zone)
-	for record in records:
-		# Construct the API endpoint URL for each record
+def auto(record):
+	if record["ttl"] != AUTO:
 		url = f"zones/{record["zone_id"]}/dns_records/{record["id"]}"
-		# Create the payload, preserving TTL and proxied settings
 		payload_as_json = {
-			"proxied": proxied
+			"ttl": AUTO
 		}
-		# Perform the patch request to update the record
 		perform("patch", url, payload_as_json)
 
-def tell_me_page_domain_stuff():
-	pages = get_pages()
-	for page in pages:
-		page_domains = get_page_domains(page)
-		if get_length(page_domains) != 1:
-			print(f"{page["name"]} should only have 1 domain.")
+def auto_records(zone):
+	records = get_records(zone)
+	for record in records:
+		auto(record)
+
+def proxy_records(zone, proxied = PROXIED):
+	records = get_records(zone)
+	for record in records:
+		proxy(record, proxied)
 
 def delete_dmarc_records(zone):
 	records = get_records(zone)
@@ -544,8 +557,7 @@ def delete_dmarc_records(zone):
 
 def do_dmarc_records(zone):
 	delete_dmarc_records(zone)
-	easy_create_record(zone, "_dmarc", "v=DMARC1; p=quarantine;")
-	# easy_create_record(zone, "_dmarc", "v=DMARC1; p=none;")
+	create_record(zone, "_dmarc", "v=DMARC1; p=quarantine;")
 
 def delete_dkim_records(zone):
 	records = get_records(zone)
@@ -553,14 +565,17 @@ def delete_dkim_records(zone):
 		if record["name"] == "_domainkey":
 			delete_record(record)
 
+def flatten(record, flatten = FLATTEN):
+	url = f"zones/{record["zone_id"]}/dns_records/{record["id"]}"
+	payload_as_json = {
+		"flatten": flatten
+	}
+	perform("patch", url, payload_as_json)
+
 def flatten_records(zone, flatten = FLATTEN):
 	records = get_records(zone)
 	for record in records:
-		url = f"zones/{record["zone_id"]}/dns_records/{record["id"]}"
-		payload_as_json = {
-			"flatten": flatten
-		}
-		perform("patch", url, payload_as_json)
+		flatten(record)
 
 def delete_smtp_server_records(zone):
 	records = get_records(zone)
@@ -568,19 +583,28 @@ def delete_smtp_server_records(zone):
 		if record["content"] == "smtp-server.blocksrey.workers.dev":
 			delete_record(record)
 
+def quoted(string):
+	return string[0] == '"' and string[-1] == '"'
+
 def unquoted(string):
 	return string[0] != '"' and string[-1] != '"'
 
-def contains_weird(string):
-	return bool(re.search(r"\W", string))
+def unquote(string):
+	return quoted(string) and string[1:-1] or string
 
-def is_tainted(record):
+def quote(string):
+	return unquoted(string) and f'"{string}"' or string
+
+def contains_weird(string):
+	return bool(re.search(r"[^\w.]", string))
+
+def tainted(record):
 	return record["type"] == TEXT and contains_weird(record["content"]) and unquoted(record["content"])
 
 def delete_tainted_records(zone):
 	records = get_records(zone)
 	for record in records:
-		if is_tainted(record):
+		if tainted(record):
 			delete_record(record)
 
 # This should be more efficient than do
@@ -589,42 +613,80 @@ def ensure_record():
 	# Otherwise, create a new one.
 	pass
 
-def do_mailchannels_records(zone):
+def delete_mailchannels_records(zone):
 	records = get_records(zone)
 	for record in records:
 		if record["name"] == "_mailchannels":
 			delete_record(record)
-	easy_create_record(zone, "_mailchannels", f"v=mc1 auth={MAILCHANNELS_ID}")
+
+def do_mailchannels_records(zone):
+	delete_mailchannels_records(zone)
+	create_record(zone, "_mailchannels", f"v=mc1 auth={MAILCHANNELS_ID}")
+
+def do_dkim_records(zone):
+	delete_dkim_records(zone)
+	# Todo
 
 def do_mail_records(zone):
 	do_spf_records(zone)
 	do_dmarc_records(zone)
 	do_mailchannels_records(zone)
-	# do_dkim_records(zone)
+	do_dkim_records(zone)
 
-def brr_funnel(zone):
+def brr_derivative(zone):
 	return "rate" in zone["name"] and zone["name"] != "bestratereview.com"
 
-def do_brr_stuff():
-	zones = get_69_zones()
+def find_page_domain(zone):
+	domain = f"{get_short_name(zone["name"])}.pages.dev"
+	for page in pages:
+		if page["subdomain"] == domain:
+			return domain
+
+def check_page_domains():
+	for page in pages:
+		page_domains = get_page_domains(page)
+		has_primary = None
+		has_secondary = None
+		for page_domain in page_domains:
+			closest_zone = get_closest_zone(page_domain["name"])
+			closest_primary, closest_secondary = get_web_pair(closest_zone["name"])
+			if page_domain["name"] == closest_primary:
+				has_primary = True
+			if page_domain["name"] == closest_secondary:
+				has_secondary = True
+		has_primary = has_primary or False
+		has_secondary = has_secondary or False
+		if not has_primary:
+			print(f"Page {page["name"]} missing primary")
+		if not has_secondary:
+			print(f"Page {page["name"]} missing secondary")
+		if len(page_domains) > 2:
+			print(f"Page {page["name"]} has too many domains")
+
+# Todo: This doesn't work.
+def do_page_domains():
+	for page in pages:
+		delete_page_domains(page)
 	for zone in zones:
-		if brr_funnel(zone):
-			print(zone)
+		create_page_domains(zone)
+
+# We should really just name the pages the same thing as the domain, that way we can look it up from the pages directly.
+# On top of that, this will introduce error...
+def get_closest_zone(name):
+	return min(zones, key=lambda zone: Levenshtein.distance(name, zone["name"]), default=None)
 
 if __name__ == "__main__":
-	global pages
-	pages = get_pages()
-	zones = get_69_zones()
-	do_brr_stuff()
+	global pages; pages = get_pages()
+	global zones; zones = get_zones()
+	# check_page_domains()
+	# check_email_forwarding()
 	for zone in zones:
-		# delete_tainted_records(zone)
-		# do_mail_records(zone)
+		# do_mailchannels_records(zone)
+		# do_dkim_records(zone)
 		# do_dmarc_records(zone)
+		# do_mail_records(zone)
+		# do_page_rules(zone)
 		# do_settings(zone)
-		# autofy_records(zone)
-		# proxify_records(zone)
+		# do_spf_records(zone)
 		# do_web_records(zone)
 		pass
-	# for page in pages:
-	# 	do_page_rules(page)
-	# tell_me_page_domain_stuff()

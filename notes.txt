@@ -1,1 +1,0 @@
-- Rate site -> Best Rate Review (Redirects as well as email forwarding)
