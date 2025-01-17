@@ -93,8 +93,9 @@ def delete_spf_record(record):
 		delete_record(record)
 
 def ensure_spf_records():
-	# ensure_record(ROOT, "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com include:relay.mailchannels.net ~all")
-	ensure_record(ROOT, "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com ~all")
+	if zone["name"] != "bestratereview.com":
+		# ensure_record(ROOT, "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com include:relay.mailchannels.net ~all")
+		ensure_record(ROOT, "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com ~all")
 
 override_levels = {}
 
@@ -157,9 +158,9 @@ override_levels["ciphers"] = []
 
 def ensure_redirect(url0, url1):
 	if len(page_rules) >= 2:
-		for i in range(len(page_rules)):
-			current_url0 = page_rules[i]["targets"][0]["constraint"]["value"]
-			current_url1 = page_rules[i]["actions"][0]["value"]["url"]
+		for page_rule in page_rules:
+			current_url0 = page_rule["targets"][0]["constraint"]["value"]
+			current_url1 = page_rule["actions"][0]["value"]["url"]
 			if current_url0 == url0 and current_url1 == url1:
 				return True
 	payload_as_json = {
@@ -288,23 +289,38 @@ def proxy_record(record, proxied):
 	if not patch(f"zones/{record["zone_id"]}/dns_records/{record["id"]}", payload_as_json):
 		print("Can't do proxy")
 
-def quote_if_space(string):
-	if " " in string:
+def quote_if_weird(string):
+	if contains_weird(string):
 		return quote(string)
 	return string
 
+# ToDo: We gotta make this handle TTL eventually.
+# Also this isn't really working how I want it to. Because SPF and Google verification records get match as the same thing and are both deleted...
 def hard_ensure_record(type, name, content, proxied = PROXIED):
+	ensured = False
+	remove = []
 	for record in records:
-		if record["type"] == type and record["name"] == name and record["content"] == content and record["proxied"] == proxied:
-			# It's the same so we can get outta here.
-			return True
+		# print(record["type"], record["name"], record["content"], record["proxied"])
+		if record["type"] == type and record["name"] == name:
+			if record["content"] == content and record["proxied"] == proxied:
+				# It's the same so we can get outta here.
+				ensured = True
+			else:
+				# The identity is the same, but not the values.
+				remove.append(record)
+
+	for record in remove:
+		delete_record(record)
+
+	if ensured:
+		return ensured
 
 	# Prioritize zone name given that @ = zone name.
 	if name == zone["name"]:
 		print("You should be using @ for the name!")
 
 	payload_as_json = {
-		"content": quote_if_space(content),
+		"content": quote_if_weird(content),
 		"name": name,
 		"proxied": proxied,
 		"ttl": AUTO,
@@ -602,7 +618,6 @@ def ensure_dkim_records():
 def ensure_mail_records():
 	ensure_spf_records()
 	ensure_dmarc_records()
-	ensure_mailchannels_records()
 	ensure_dkim_records()
 
 def brr_derivative():
@@ -644,15 +659,26 @@ def check_page_domain():
 def get_closest_zone(name):
 	return min(zones, key=lambda zone: Levenshtein.distance(name, zone["name"]), default=None)
 
-def check_email_forwarding():
-	emails = get(f"zones/{zone["id"]}/email/routing/addresses")
-	print(f"Emails {emails}")
+# ToDo: This should anylitically check if they're forwarding to the correct email as opposed to "is forwarding on/off?"
+def check_email_routing():
+	# emails = get(f"accounts/{ACCOUNT_ID}/email/routing/addresses")
+	routing_info = get(f"zones/{zone["id"]}/email/routing")
+	if brr_derivative() and routing_info["enabled"] == False:
+		print(f"Turn on email routing for {zone["name"]}!")
 
 def depend(func, grab):
 	exec(f"""get_{grab}s()
 for _{grab} in {grab}s:
 	global {grab}; {grab} = _{grab}
 	func()""")
+
+def ensure_the_important_brr_record():
+	if zone["name"] == "bestratereview.com":
+		ensure_record("@", "google-site-verification=1O4KHQCY_QaBmRlMHA_WUU3LGeqjmKr_4JN25L5_ybQ")
+
+def print_rob_email_derivative():
+	if brr_derivative():
+		print(f"rob@{zone["name"]}")
 
 if __name__ == "__main__":
 	def _():
@@ -662,12 +688,12 @@ if __name__ == "__main__":
 		# Records
 		get_records()
 		ensure_web_records()
-		ensure_dkim_records()
-		ensure_dmarc_records()
 		ensure_mail_records()
-		ensure_spf_records()
-		# check_email_forwarding()
+		check_email_routing()
+		# Just do this last so it's impossible to fuck up.
+		ensure_the_important_brr_record()
 		# Page rules
 		get_page_rules()
 		ensure_page_rules()
+		print_rob_email_derivative()
 	depend(_, "zone")
