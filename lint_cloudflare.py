@@ -8,6 +8,8 @@
 
 # TODO: Make a function to lint URLs (ensure trailing slashes) on Pages, Workers, etc.
 
+# TODO: We need to get the unsubscribe thing to work, we gotta allow the worker to accept the /unsubscribe connections.
+
 class Table(dict):
 	def __init__(self, data=None):
 		super().__init__()
@@ -103,9 +105,10 @@ MAIL = "MX"
 VPS = os.getenv("VPS")
 
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 
 CLOUDFLARE_HEADERS = Table({
-	"Authorization": f"Bearer {os.getenv("CLOUDFLARE_API_TOKEN")}",
+	"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
 	"Content-Type": "application/json"
 })
 
@@ -195,15 +198,15 @@ overrides.security_header = Table({"strict_transport_security": {"enabled": Fals
 
 overrides.ciphers = []
 
-def make_setting(zone, id = None, value = None, cf_data = None):
-	if cf_data:
-		id = cf_data.id
-		value = cf_data.value
+def make_setting(zone, id = None, value = None, cloudee = None):
+	if cloudee:
+		id = cloudee.id
+		value = cloudee.value
 
-	zone = zone or print(zone.name, "missing zone")
-	value = value# or print(zone.name, "missing value")
+	zone = zone or print(zone.name, "setting, missing zone")
+	value = value# or print(zone.name, "setting, missing value")
 
-	def location():
+	def identity():
 		return zone.name + str(id) + str(value)
 
 	def push():
@@ -226,37 +229,38 @@ def make_setting(zone, id = None, value = None, cf_data = None):
 		# print("you can't remove a setting lol", self)
 
 	self = Table()
-	self.remove = remove
 	self.id = id
-	self.location = location
+	self.identity = identity
 	self.push = push
+	self.remove = remove
+	self.type = "setting"
 
-	if cf_data:
-		cf_items[location()] = self
+	if cloudee:
+		cloud[identity()] = self
 	else:
-		local[location()] = self
+		local[identity()] = self
 
 	return self
 
 # TODO: We gotta make this handle TTL eventually.
 # Also this isn't really working how I want it to. Because SPF and Google verification records get match as the same thing and are both removed...
-def make_record(zone, name = None, content = None, type = None, proxied = PROXIED, priority = None, ttl = AUTO, id = None, cf_data = None):
-	if cf_data:
-		if 0 < len(cf_data.tags):
-			title = cf_data.tags[0]
-		if cf_data.name == zone.name:
+def make_record(zone, name = None, content = None, type = None, proxied = PROXIED, priority = None, ttl = AUTO, id = None, title = None, cloudee = None):
+	if cloudee:
+		if 0 < len(cloudee.tags):
+			title = cloudee.tags[0]
+		if cloudee.name == zone.name:
 			name = ROOT
-		elif cf_data.name.endswith(f".{zone.name}"):
-			name = cf_data.name[0:-(1 + len(zone.name))]
-		if quoted(cf_data.content):
-			content = unquote(cf_data.content)
+		elif cloudee.name.endswith(f".{zone.name}"):
+			name = cloudee.name[0:-(1 + len(zone.name))]
+		if quoted(cloudee.content):
+			content = unquote(cloudee.content)
 		else:
-			content = cf_data.content
-		ttl = int(cf_data.ttl)
-		proxied = cf_data.proxied
-		type = cf_data.type
-		priority = cf_data.priority
-		id = cf_data.id
+			content = cloudee.content
+		ttl = int(cloudee.ttl)
+		proxied = cloudee.proxied
+		type = cloudee.type
+		priority = cloudee.priority
+		id = cloudee.id
 		# Sorry, did the API change or something? This used to be built in I thought.
 
 	if type == None:
@@ -279,13 +283,13 @@ def make_record(zone, name = None, content = None, type = None, proxied = PROXIE
 
 	content = quote_if_weird(content)
 
-	name = name or print(zone.name, "missing name")
-	type = type or print(zone.name, "missing type")
-	content = content or print(zone.name, "missing content")
-	proxied = proxied# or print(zone.name, "missing proxied")
-	ttl = ttl or print(zone.name, "missing ttl")
-	priority = priority# or print(zone.name, "missing priority")
-	zone = zone or print(zone.name, "missing zone")
+	name = name or print(zone.name, "record, missing name")
+	type = type or print(zone.name, "record, missing type")
+	content = content or print(zone.name, "record, missing content")
+	proxied = proxied# or print(zone.name, "record, missing proxied")
+	ttl = ttl or print(zone.name, "record, missing ttl")
+	priority = priority# or print(zone.name, "record, missing priority")
+	zone = zone or print(zone.name, "record, missing zone")
 
 	# TODO
 	# def flatten(record, flatten = FLATTEN):
@@ -296,7 +300,7 @@ def make_record(zone, name = None, content = None, type = None, proxied = PROXIE
 	def proxy(on):
 		proxied = on
 
-	def location():
+	def identity():
 		return zone.name + name + type + content + str(proxied) + str(ttl) + str(priority)
 
 	def is_web():
@@ -316,30 +320,31 @@ def make_record(zone, name = None, content = None, type = None, proxied = PROXIE
 
 	def remove():
 		if not delete(f"zones/{zone.id}/dns_records/{id}"):
-			# print(f"error {zone.name} remove record [{type}, {name}, {content}]")
 			pass
+			# print(f"error {zone.name} remove record [{type}, {name}, {content}]")
 
 	self = Table()
-	self.remove = remove
 	self.is_web = is_web
-	self.location = location
+	self.identity = identity
 	self.push = push
+	self.remove = remove
+	self.type = "record"
 
-	if cf_data:
-		cf_items[location()] = self
+	if cloudee:
+		cloud[identity()] = self
 	else:
-		local[location()] = self
+		local[identity()] = self
 
 	return self
 
-def make_route(zone, origin = None, target = None, cf_data = None):
-	if cf_data:
-		origin = cf_data.pattern
-		target = cf_data.script
-		id = cf_data.id
+def make_route(zone, origin = None, target = None, cloudee = None):
+	if cloudee:
+		origin = cloudee.pattern
+		target = cloudee.script
+		id = cloudee.id
 
-	origin = origin or print(zone.name, "missing origin")
-	target = target or print(zone.name, "missing target")
+	origin = origin or print(zone.name, "route, missing origin")
+	target = target or print(zone.name, "route, missing target")
 
 	def remove():
 		if not delete(f"zones/{zone.id}/workers/routes/{id}"):
@@ -348,35 +353,36 @@ def make_route(zone, origin = None, target = None, cf_data = None):
 	def push():
 		data = {
 			"pattern": origin,
-			"target": target
+			"script": target
 		}
 		if not post(f"zones/{zone.id}/workers/routes", data):
 			print(f"error {zone.name} create worker route {origin}")
 
-	def location():
-		return zone.name + origin + target
+	def identity():
+		return zone.name + origin + str(target)
 
 	self = Table()
-	self.remove = remove
-	self.location = location
+	self.identity = identity
 	self.push = push
+	self.remove = remove
+	self.type = "route"
 
-	if cf_data:
-		cf_items[location()] = self
+	if cloudee:
+		cloud[identity()] = self
 	else:
-		local[location()] = self
+		local[identity()] = self
 
 	return self
 
-def make_rule(zone, target = None, enabled = True, cf_data = None):
-	if cf_data:
-		target = cf_data.actions[0].type != "drop" and cf_data.actions[0].value[0]
-		enabled = cf_data.enabled # Make sure this is working
-		id = cf_data.id
+def make_rule(zone, target = None, enabled = True, cloudee = None):
+	if cloudee:
+		target = cloudee.actions[0].type != "drop" and cloudee.actions[0].value[0]
+		enabled = cloudee.enabled # Make sure this is working
+		id = cloudee.id
 
-	target = target or print(zone.name, "missing target")
+	target = target or print(zone.name, "rule, missing target")
 
-	def location():
+	def identity():
 		return zone.name + str(target) + str(enabled)
 
 	def remove():
@@ -402,26 +408,43 @@ def make_rule(zone, target = None, enabled = True, cf_data = None):
 			print(f"error {zone.name} make e-rule {target}")
 
 	self = Table()
-	self.remove = remove
-	self.location = location
+	self.identity = identity
 	self.push = push
+	self.remove = remove
+	self.type = "rule"
 
-	if cf_data:
-		cf_items[location()] = self
+	if cloudee:
+		cloud[identity()] = self
 	else:
-		local[location()] = self
+		local[identity()] = self
 
 	return self
 
-def make_pagerule(zone, origin = None, target = None, cf_data = None):
-	if cf_data:
-		origin = cf_data.targets[0].constraint.value
-		target = cf_data.actions[0].value.url
-		id = cf_data.id
+cloud_pagerule_counts = Table()
+local_pagerule_queues = Table()
 
-	origin = origin or print(zone.name, "missing origin")
-	target = target or print(zone.name, "missing target")
-	zone = zone or print(zone.name, "missing zone")
+def make_pagerule(zone, origin = None, target = None, position = None, cloudee = None):
+	self = Table()
+
+	if cloudee:
+		origin = cloudee.targets[0].constraint.value
+		target = cloudee.actions[0].value.url
+		if cloud_pagerule_counts.get(zone.name) != None:
+			cloud_pagerule_counts[zone.name] += 1
+		else:
+			cloud_pagerule_counts[zone.name] = 1
+		position = cloud_pagerule_counts[zone.name]
+		id = cloudee.id
+	else:
+		if local_pagerule_queues.get(zone.name) != None:
+			local_pagerule_queues[zone.name].append(self)
+		else:
+			local_pagerule_queues[zone.name] = [self]
+		position = len(local_pagerule_queues[zone.name])
+
+	origin = origin or print(zone.name, "pagerule, missing origin")
+	target = target or print(zone.name, "pagerule, missing target")
+	zone = zone or print(zone.name, "pagerule, missing zone")
 
 	def push():
 		data = {
@@ -443,38 +466,41 @@ def make_pagerule(zone, origin = None, target = None, cf_data = None):
 					}
 				}
 			],
-			"priority": 1, # LMAO
+			# "priority": priority,
+			"priority": 1, # Append
 			"status": "active"
 		}
 		if not post(f"zones/{zone.id}/pagerules", data):
-			print(f"error {zone.name} make rule [{origin} -> {target}]")
+			print(f"error {zone.name} make pagerule [{origin} -> {target}]")
 
-	def location():
-		return zone.name + origin + target
+	def identity():
+		return zone.name + origin + target + str(position)
 
 	def remove():
 		if not delete(f"zones/{zone.id}/pagerules/{id}"):
-			print(f"error {zone.name} remove rule [{origin} -> {target}]")
+			print(f"error {zone.name} remove pagerule [{origin} -> {target}]")
 
-	self = Table()
-	self.remove = remove
-	self.location = location
-	self.push = push
-
-	if cf_data:
-		cf_items[location()] = self
+	if cloudee:
+		# print(zone.name, "cloud pagerule", position, origin, target)
+		cloud[identity()] = self
 	else:
-		local[location()] = self
+		# print(zone.name, "local pagerule", position, origin, target)
+		local[identity()] = self
+
+	self.identity = identity
+	self.push = push
+	self.remove = remove
+	self.type = "pagerule"
 
 	return self
 
-def make_domain(page, name = None, cf_data = None):
-	if cf_data:
-		name = cf_data.name
+def make_domain(page, name = None, cloudee = None):
+	if cloudee:
+		name = cloudee.name
 
-	name = name or print(page.name, "missing name")
+	name = name or print(page.name, "domain, missing name")
 
-	def location():
+	def identity():
 		return page.name + name
 
 	def remove():
@@ -489,47 +515,71 @@ def make_domain(page, name = None, cf_data = None):
 			print(f"error {page.name} make domain {name}")
 
 	self = Table()
-	self.remove = remove
-	self.location = location
+	self.identity = identity
 	self.push = push
+	self.remove = remove
+	self.type = "domain"
 
-	if cf_data:
-		cf_items[location()] = self
+	if cloudee:
+		cloud[identity()] = self
 	else:
-		local[location()] = self
+		local[identity()] = self
 
 	return self
 
-def fetch():
-	global cf_items
-	global local
-	global pages
-	global zones
-	# global domains
-	cf_items = Table()
-	local = Table()
-	pages = Table()
+# Thanks ChatGPT
+def get_pages():
+	url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects"
+	headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"}
+
+	projects = []
+	page = 1
+	while True:
+		response = requests.get(f"{url}?page={page}", headers=headers).json()
+		if not response.get("success", False):
+			print("Error fetching data:", response)
+			break
+
+		projects.extend(response.get("result", []))
+		result_info = response.get("result_info", {})
+
+		if result_info.get("page", 1) >= result_info.get("total_pages", 1):
+			break
+		page += 1
+
+	return Table(projects)
+
+def get_zones():
 	zones = Table()
 	page = 1
-	while (data := get(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects?page={page}")):
+	while (data := get(f"zones?per_page=69&page={page}")):
 		for thing in data:
-			pages.insert(thing)
-			if len(data) < 10:
-				break
-			page += 1
+			zones.insert(thing)
+		if len(data) < 69:
+			break
+		page += 1
+	return zones
+
+def get_domains(pages):
+	page = 1
 	for k in pages:
 		page = pages[k]
 		domains = Table(get(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects/{page.name}/domains"))
 		page.domains = domains
 		for k in domains:
-			domains[k] = make_domain(page, cf_data = domains[k])
-	page = 1
-	while (data := get(f"zones?per_page=69&page={page}")):
-		for thing in data:
-			zones.insert(Table(thing))
-		if len(data) < 69:
-			break
-		page += 1
+			domains[k] = make_domain(page, cloudee = domains[k])
+
+def fetch():
+	global cloud
+	global local
+	global pages
+	global zones
+	# global domains
+	cloud = Table()
+	local = Table()
+	pages = get_pages()
+	zones = get_zones()
+	get_domains(pages)
 	for k in zones:
 		zone = zones[k]
 		pagerules = Table(get(f"zones/{zone.id}/pagerules"))
@@ -543,55 +593,34 @@ def fetch():
 		zone.rules = rules
 		zone.settings = settings
 		for k in pagerules:
-			pagerules[k] = make_pagerule(zone, cf_data = pagerules[k])
+			pagerules[k] = make_pagerule(zone, cloudee = pagerules[k])
 		for k in records:
-			records[k] = make_record(zone, cf_data = records[k])
+			records[k] = make_record(zone, cloudee = records[k])
 		for k in routes:
-			routes[k] = make_route(zone, cf_data = routes[k])
+			routes[k] = make_route(zone, cloudee = routes[k])
 		for k in rules:
-			rules[k] = make_rule(zone, cf_data = rules[k])
+			rules[k] = make_rule(zone, cloudee = rules[k])
 		for k in settings:
-			settings[k] = make_setting(zone, cf_data = settings[k])
+			settings[k] = make_setting(zone, cloudee = settings[k])
 
 def do_sendgrid_senders():
+	global zones
 	for k in zones:
 		zone = zones[k]
 		if brr_child(zone):
-			make_sendgrid_sender(f"{HOOK_DN}@{zone.name}")
-
-def responding(address):
-	try:
-		requests.head(f"https://{address}/")
-		return True
-	except:
-		return False
-
-def do_web_records():
-	for k in zones:
-		zone = zones[k]
-		# This is pretty bad.
-		revert = None
-		if zone.name == "southtowntattoocollective.com":
-			revert = "southtowntattoocollective.com"
-			zone.name = "tattoocollectivereno.com"
-
-		address = get_domain_from_zone_if_exists(zone)
-		if not address:
-			if zone.name == "bestratereview.com":
-				address = "35.192.114.80"
-			else:
-				address = VPS
-
-		if standard(zone):
-			make_record(zone, WWW, address)
-			make_record(zone, ROOT, address)
-		else:
-			make_record(zone, ROOT, address)
-			make_record(zone, WWW, address)
-
-		# This is part of the pretty bad thing.
-		if revert:
-			zone.name = revert
+			make_sendgrid_sender(zone, f"{HOOK_DN}@{zone.name}")
+	response = requests.get("https://api.sendgrid.com/v3/whitelabel/domains?limit=1337", headers = SENDGRID_HEADERS)
+	if response.status_code == 200:
+		for item in response.json():
+			for i in item["dns"]:
+				record = item["dns"][i]
+				zone_name = domain(record["host"])
+				for j in zones:
+					zone = zones[j]
+					if zone.name == zone_name:
+						make_record(zone, record["host"].replace(f".{zone.name}", ""), record["data"], title = "sendgrid", proxied = UNPROXIED)
+	else:
+		print("error getting the Sendgrid domains")
 
 def quote_if_weird(string):
 	if weird(string):
@@ -651,11 +680,20 @@ def quote(string):
 def weird(string):
 	return bool(re.search(r"[^\w.]", string))
 
+def domain(address):
+	parts = address.split(".")
+	if len(parts) < 2:
+		return address # Return as-is if not a valid subdomain structure
+	return ".".join(parts[-2:])
+
 def brr_child(zone):
 	return "rate" in zone.name and zone.name != "bestratereview.com"
 
-def get_domain_from_zone_if_exists(zone):
-	target = f"{short(zone)}.pages.dev"
+def zone_page(zone):
+	look = short(zone)
+	if zone.name == "southtowntattoocollective.com":
+		look = "tattoocollectivereno"
+	target = f"{look}.pages.dev"
 	for k in pages:
 		page = pages[k]
 		domain = page.subdomain
@@ -727,7 +765,7 @@ SENDGRID_HEADERS = Table({
 	"Content-Type": "application/json"
 })
 
-def make_sendgrid_sender(email):
+def make_sendgrid_sender(zone, email):
 	data = Table({
 		"address": "12575 Beatrice St",
 		"city": "Los Angeles",
@@ -747,45 +785,41 @@ def make_sendgrid_sender(email):
 	response = requests.post("https://api.sendgrid.com/v3/marketing/senders", json = data, headers = SENDGRID_HEADERS)
 	if response.status_code != 201:
 		print(f"error creating {email}:", response.json())
-	if True:
-		data = Table({
-			"domain": zone.name,
-			"subdomain": "mail",
-			"automatic_security": True,
-			"custom_spf": False
-		})
-		response = requests.post("https://api.sendgrid.com/v3/whitelabel/domains", json = data, headers = SENDGRID_HEADERS)
-		if response.status_code == 201:
-			dns = response.json().dns
-			for i in dns:
-				record_info = dns[i]
-				make_record(zone, record_info.host.replace(f".{zone.name}", ""), record_info.data, title = "sendgrid", proxied = UNPROXIED)
-		else:
-			print(f"error {response.status_code}, {response.text}")
+	data = Table({
+		"domain": zone.name,
+		"subdomain": "sendgrid",
+		"automatic_security": True,
+		"custom_spf": False
+	})
+	response = requests.post("https://api.sendgrid.com/v3/whitelabel/domains", json = data, headers = SENDGRID_HEADERS)
+	if response.status_code != 201:
+		print(f"error {response.status_code}, {response.text}")
 
 def run_deltas():
-	for location in cf_items:
-		if not local.get(location):
-			cf_items[location].remove()
-	for location in local:
-		if not cf_items.get(location):
-			local[location].push()
+	for identity in cloud:
+		if not local.get(identity):
+			cloud[identity].remove()
+	for identity in local:
+		if not cloud.get(identity):
+			item = local[identity]
+			if item.type != "pagerule":
+				item.push()
+	for zone_name in local_pagerule_queues:
+		queue = local_pagerule_queues[zone_name]
+		for item in queue:
+			if not cloud.get(item.identity()):
+				item.push()
 
 if __name__ == "__main__":
 	fetch()
-	do_web_records()
-	# Email stuff
+
+	do_sendgrid_senders()
+
 	for k in zones:
 		zone = zones[k]
-
-		# BRR unsubscribe configuration
-		# if not brr_has_mail_record(zone):
-		# 	print(zone, "is missing brr mail record")
-		# if not zone.name in unsubscribe_worker.domains:
-		# 	print(domain, "is missing from brr unsubscribe worker")
+		first, second = pair(zone)
 
 		# Records
-		make_record(zone, "api", f"{short(zone)}.jaydeeskinner.workers.dev")
 		if brr_child(zone):
 			make_rule(zone, "brr")
 		elif zone.name == "bestratereview.com":
@@ -798,29 +832,45 @@ if __name__ == "__main__":
 		else:
 			make_rule(zone, target = "jeff@je.gy")
 
+		address = zone_page(zone)
+
+		if not address:
+			if "rate" in zone.name:
+				address = "35.192.114.80"
+			else:
+				address = VPS
+
+		if standard(zone):
+			make_record(zone, WWW, address)
+			make_record(zone, ROOT, address)
+		else:
+			make_record(zone, ROOT, address)
+			make_record(zone, WWW, address)
+
 		# Mail stuff
 		make_record(zone, ROOT, "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com include:sendgrid.net ~all")
 		make_record(zone, "_dmarc", "v=DMARC1; p=quarantine;")
 		# make_record(zone, "_mailchannels", f"v=mc1 auth={os.getenv("MAILCHANNELS_ID")}", title = "mailchannels")
 		# TODO: We also need to make DKIM records.
 
+		# Mail tracking (unsubscribes, etc.)
+		make_record(zone, "mail", "mail.jaydeeskinner.workers.dev")
+		make_route(zone, f"mail.{zone.name}/unsubscribe*", "mail")
+
 		# Page rules (redirects)
-		first, second = pair(zone)
-		# This fixes the Instagram redirect thing.
-		make_pagerule(zone, f"https://{first}/fbclid*", f"https://{first}/")
-		if brr_child(zone):
-			make_pagerule(zone, f"https://{first}/*", f"https://www.bestratereview.com/$1")
-			make_pagerule(zone, f"https://{second}/*", f"https://www.bestratereview.com/$1")
-		elif zone.name == "jaydeeskinner.com":
-			make_pagerule(zone, f"https://{first}/", f"https://{first}/index.htm")
+		make_pagerule(zone, f"http://{second}/*", f"http://{first}/$1")
+		make_pagerule(zone, f"http://{first}/fbclid*", f"http://{first}/") # This fixes the Instagram redirect thing.
+		if zone.name == "jaydeeskinner.com":
+			make_pagerule(zone, f"http://{first}/", f"http://{first}/index.htm")
+		elif brr_child(zone):
+			make_pagerule(zone, f"http://*{domain(first)}/*", f"http://$1bestratereview.com/$2")
 		elif zone.name == "southtowntattoocollective.com":
-			make_pagerule(zone, f"https://*southtowntattoocollective.com/*", f"https://$1tattoocollectivereno.com/$2") # This works for now.
+			make_pagerule(zone, f"http://*southtowntattoocollective.com/*", f"http://$1tattoocollectivereno.com/$2") # This works for now.
 		else:
-			make_pagerule(zone, f"https://{second}/*", f"https://{first}/$1")
+			pass
 
 		# Page domains
 		name = short(zone)
-		first, second = pair(zone)
 		for k in pages:
 			page = pages[k]
 			if page.name == name:
@@ -833,17 +883,12 @@ if __name__ == "__main__":
 			if setting.editable:
 				make_setting(zone, setting.id, overrides[setting.id])
 
-		# Routes
-		# make_route(zone, f"api.{zone.name}/", short(zone)) # API routes
-		# # Forward should really be called lint URL or something different.
-		# # URL linter route
-		# if standard(zone):
-		# 	make_route(zone, f"www.{zone.name}/*", "forward")
-		# else:
-		# 	make_route(zone, f"{zone.name}/*", "forward")
-		# # if zone.name == "leetforms.com":
-		# # 	make_route("leetforms", f"tattoocollectivereno.leetforms.com/")
-		# # make_route("forward", f"*{zone.name}/*")
+		# API
+		make_record(zone, "api", f"{short(zone)}.jaydeeskinner.workers.dev") # TODO: We should have a function to check if the worker domain exists in the first place.
+		make_route(zone, f"api.{zone.name}/*", short(zone)) # API routes, also we might need to change to /* instead of /.
 
-	# do_sendgrid_senders()
+		# Forward should really be called lint URL or something different.
+		# URL linter route
+		make_route(zone, f"{first}/*", "forward")
+
 	run_deltas()
