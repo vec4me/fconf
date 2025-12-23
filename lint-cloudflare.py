@@ -600,35 +600,6 @@ def fetch():
                 break
 
 
-def do_sendgrid_senders():
-    global zones
-    for k in zones:
-        zone = zones[k]
-        if brr_child(zone):
-            make_sendgrid_sender(zone, f"{HOOK_DN}@{zone.name}")
-    response = requests.get(
-        "https://api.sendgrid.com/v3/whitelabel/domains?limit=1337",
-        headers=SENDGRID_HEADERS,
-    )
-    if response.status_code == 200:
-        for item in response.json():
-            for i in item["dns"]:
-                record = item["dns"][i]
-                zone_name = domain(record["host"])
-                for j in zones:
-                    zone = zones[j]
-                    if zone.name == zone_name:
-                        make_record(
-                            zone,
-                            record["host"].replace(f".{zone.name}", ""),
-                            record["data"],
-                            title="sendgrid",
-                            proxied=UNPROXIED,
-                        )
-    else:
-        print("error getting the Sendgrid domains")
-
-
 def quote_if_weird(string):
     if weird(string):
         return quote(string)
@@ -872,53 +843,6 @@ HOOK_DN = HOOK_NAME.split(" ")[0].lower()
 # 	response = requests.post(url, headers = headers, data = json.dumps(data))
 # 	print(response.json())
 
-# Sendgrid stuff goes here
-
-SENDGRID_HEADERS = Table(
-    {
-        "Authorization": f"Bearer {os.getenv('SENDGRID_API_KEY')}",
-        "Content-Type": "application/json",
-    }
-)
-
-
-def make_sendgrid_sender(zone, email):
-    data = Table(
-        {
-            "address": "12575 Beatrice St",
-            "city": "Los Angeles",
-            "country": "USA",
-            "from": {"email": email, "name": HOOK_NAME},
-            "nickname": email,
-            "reply_to": {"email": email, "name": HOOK_NAME},
-            "state": "CA",
-            "zip": "90066",
-        }
-    )
-    response = requests.post(
-        "https://api.sendgrid.com/v3/marketing/senders",
-        json=data,
-        headers=SENDGRID_HEADERS,
-    )
-    if response.status_code != 201:
-        print(f"error creating {email}:", response.json())
-    data = Table(
-        {
-            "domain": zone.name,
-            "subdomain": "sendgrid",
-            "automatic_security": True,
-            "custom_spf": False,
-        }
-    )
-    response = requests.post(
-        "https://api.sendgrid.com/v3/whitelabel/domains",
-        json=data,
-        headers=SENDGRID_HEADERS,
-    )
-    if response.status_code != 201:
-        print(f"error {response.status_code}, {response.text}")
-
-
 def run_deltas():
     for identity in cloud:
         if not local.get(identity):
@@ -930,8 +854,6 @@ def run_deltas():
 
 if __name__ == "__main__":
     fetch()
-
-    # do_sendgrid_senders()
 
     for k in zones:
         zone = zones[k]
@@ -999,7 +921,7 @@ if __name__ == "__main__":
         make_record(
             zone,
             ROOT,
-            "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com include:sendgrid.net ~all",
+            "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com ~all",
         )
         make_record(zone, "_dmarc", "v=DMARC1; p=quarantine;")
         # make_record(zone, "_mailchannels", f"v=mc1 auth={os.getenv("MAILCHANNELS_ID")}", title = "mailchannels")
