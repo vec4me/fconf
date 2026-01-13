@@ -1,219 +1,202 @@
-# Cloudflare Linter by Jeffrey Skinner <jeff@je.gy> a.k.a. vec4me
-# I should do patching instead of deleting everything and rewriting.
+from __future__ import annotations
 
-# TODO: We should first pull, then make changes to the local data, then have a push function where we actually start to send the requests. This would probably be faster because we can compile deltas.
-# This would also make it very easy to find extraneous configurations in which we can easily remove. This'll be good.
-
-# TODO: We need to actually check if email routing is enabled for the zone.
-
-# TODO: Make a function to lint URLs (ensure trailing slashes) on Pages, Workers, etc.
-
-# TODO: We need to get the unsubscribe thing to work, we gotta allow the worker to accept the /unsubscribe connections.
-
-
-class Table(dict):
-    def __init__(self, data=None):
-        super().__init__()
-        self._counter = 0
-
-        if data:
-            if isinstance(data, dict):
-                for key, value in data.items():
-                    self[key] = self._convert(value)
-            elif isinstance(data, (list, tuple, set)):  # Handle other iterables
-                for value in data:
-                    self.insert(value)
-
-        self._initialize_counter()  # Set _counter to length of continuous numerical keys
-
-    def __getattr__(self, key):
-        try:
-            return self[key]
-        except KeyError:
-            return None
-
-    def __setattr__(self, key, value):
-        if key == "_counter":
-            super().__setattr__(key, value)
-        else:
-            self[key] = self._convert(value)
-
-    def __delattr__(self, key):
-        try:
-            del self[key]
-        except KeyError:
-            raise AttributeError(
-                f"'{self.__class__.__name__}' object has no attribute '{key}'"
-            )
-
-    @classmethod
-    def _convert(cls, value):
-        if isinstance(value, dict):
-            return cls(value)
-        elif isinstance(value, list):
-            return [cls._convert(item) for item in value]
-        return value
-
-    def insert(self, value):
-        key = str(self._counter)
-        self[key] = self._convert(value)
-        self._counter += 1
-
-    def _initialize_counter(self):
-        numeric_keys = sorted(int(k) for k in self.keys() if k.isdigit())
-        self._counter = 0
-
-        for key in numeric_keys:
-            if key == self._counter:
-                self._counter += 1
-            else:
-                break  # Stop at the first discontinuity
-
-    def __eq__(self, other):
-        if isinstance(other, Table):
-            return dict(self) == dict(other)  # Compare internal dictionaries
-        return False
-
-    def __hash__(self):
-        # Create a consistent hash based on sorted key-value pairs
-        # We sort the items to ensure that different insertion orders still yield the same hash.
-        return hash(frozenset(self.items()))
-
+import os
+from typing import Any, Callable, Generator, Literal, TypedDict
 
 import requests
-import json
-import re
-import os
-import copy
-from collections.abc import Mapping, Sequence
-
-ADDRESS = "A"
-WILD = "*"
-CNAME = "CNAME"
-FLATTEN = True
-UNFLATTEN = False
-PROXIED = True
-UNPROXIED = False
-ROOT = "@"
-TEXT = "TXT"
-WWW = "www"
-GATEWAY = "1.1.1.1"
-AUTO = 1
-RESPECT_HEADERS = 0  # Apparently 0 is the equivalent of "respect headers."
-ONE_DAY = 86400
-ONE_WEEK = 604800
-TWO_HOURS = 7200
-MAIL = "MX"
-
-VPS = os.getenv("VPS")
-
-CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
-CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
-
-CLOUDFLARE_HEADERS = Table(
-    {
-        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-        "Content-Type": "application/json",
-    }
-)
 
 
-def delete(url):
-    return perform("delete", url)
+# Type definitions
+class LeafNode(TypedDict):
+    value: Any
+    push: Callable[[], None]
+    remove: Callable[[], None]
 
 
-def get(url):
-    return perform("get", url)
+ConfigTree = dict[str, "ConfigTree | LeafNode"]
+Path = tuple[str, ...]
+Diff = tuple[Literal["remove", "push", "update"], Path, LeafNode]
+
+# Global state
+cloud: ConfigTree = {}
+local: ConfigTree = {}
+zones: dict[str, dict[str, Any]] = {}
+workers: dict[str, dict[str, Any]] = {}
+pages: dict[str, dict[str, Any]] = {}
+missing_settings: set[str] = set()
 
 
-def patch(url, data):
-    return perform("patch", url, data)
+# Tree utilities for nested config structure
+def set_tree(
+    tree: ConfigTree,
+    path: Path,
+    value: ConfigValue,
+    push_fn: Callable[[], None],
+    remove_fn: Callable[[], None],
+) -> None:
+    """Set a value at a path in a nested dict tree."""
+    for key in path[:-1]:
+        if key not in tree:
+            tree[key] = {}
+        tree = tree[key]  # type: ignore
+    tree[path[-1]] = {"value": value, "push": push_fn, "remove": remove_fn}
 
 
-def post(url, data):
-    return perform("post", url, data)
+def diff_trees(
+    cloud: ConfigTree, local: ConfigTree, path: Path = ()
+) -> Generator[Diff, None, None]:
+    """Yield (action, path, node) for all differences between trees."""
+    cloud_keys = set(cloud.keys()) if isinstance(cloud, dict) else set()
+    local_keys = set(local.keys()) if isinstance(local, dict) else set()
+
+    # In cloud but not local -> remove
+    for key in cloud_keys - local_keys:
+        node = cloud[key]
+        if "value" in node:
+            yield ("remove", path + (key,), node)  # type: ignore
+        else:
+            yield from diff_trees(node, {}, path + (key,))  # type: ignore
+
+    # In local but not cloud -> push
+    for key in local_keys - cloud_keys:
+        node = local[key]
+        if "value" in node:
+            yield ("push", path + (key,), node)  # type: ignore
+        else:
+            yield from diff_trees({}, node, path + (key,))  # type: ignore
+
+    # In both -> recurse or compare values
+    for key in cloud_keys & local_keys:
+        cloud_node = cloud[key]
+        local_node = local[key]
+        if "value" in cloud_node and "value" in local_node:
+            # Leaf nodes - compare values
+            if cloud_node["value"] != local_node["value"]:
+                yield ("update", path + (key,), local_node)  # type: ignore
+        elif "value" not in cloud_node and "value" not in local_node:
+            # Both are intermediate nodes - recurse
+            yield from diff_trees(cloud_node, local_node, path + (key,))  # type: ignore
+        else:
+            # Mismatch: one is leaf, one is intermediate (shouldn't happen)
+            if "value" in cloud_node:
+                yield ("remove", path + (key,), cloud_node)  # type: ignore
+            if "value" in local_node:
+                yield ("push", path + (key,), local_node)  # type: ignore
 
 
-types = Table()
-types.delete = requests.delete
-types.get = requests.get
-types.patch = requests.patch
-types.post = requests.post
-types.put = requests.put
+# DNS constants
+ADDRESS, CNAME, TEXT, MAIL = "A", "CNAME", "TXT", "MX"
+PROXIED, UNPROXIED = True, False
+ROOT, WWW = "@", "www"
+AUTO, RESPECT_HEADERS = 1, 0
+ONE_WEEK, TWO_HOURS = 604800, 7200
 
+VPS: str | None = os.getenv("VPS")
 
-def perform(type, url, json=None):
-    response = types[type](
+CLOUDFLARE_ACCOUNT_ID: str | None = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_API_TOKEN: str | None = os.getenv("CLOUDFLARE_API_TOKEN")
+
+CLOUDFLARE_HEADERS: dict[str, str] = {
+    "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+    "Content-Type": "application/json",
+}
+
+def perform(method: str, url: str, json: dict[str, Any] | None = None) -> Any | Literal[False]:
+    response = getattr(requests, method)(
         f"https://api.cloudflare.com/client/v4/{url}",
         headers=CLOUDFLARE_HEADERS,
         json=json,
     )
-    if response.status_code == 200:
-        return response.json()["result"]
+    if response.status_code in (200, 204):
+        if not response.text:
+            return True
+        return response.json().get("result", True)
     else:
+        try:
+            errors = response.json().get("errors", [])
+            print(f"  API error: {errors}")
+        except:
+            print(f"  API error: {response.status_code} {response.text[:200]}")
         return False
 
 
-overrides = Table()
-overrides["0rtt"] = "on"  # Extra performance
-overrides.always_online = "off"  # This is cool, but bad for debugging.
-overrides.always_use_https = "off"  # Never always do anything.
-overrides.automatic_https_rewrites = "off"
-overrides.brotli = "on"  # Transparent
-overrides.browser_check = "off"
-overrides.development_mode = "off"
-overrides.early_hints = "off"
-overrides.email_obfuscation = "off"  # Stupid
-overrides.filter_logs_to_cloudflare = "off"
-overrides.hotlink_protection = "off"  # Stupid
-overrides.http3 = "on"  # Support HTTP/3
-overrides.ip_geolocation = "on"
-overrides.ipv6 = "on"  # Support IPv6
-overrides.log_to_cloudflare = "on"
-overrides.opportunistic_encryption = "off"
-overrides.opportunistic_onion = "off"
-overrides.pq_keyex = "off"
-overrides.privacy_pass = "off"
-overrides.pseudo_ipv4 = "off"  # Pseudo-stuff isn't good.
-overrides.replace_insecure_js = "off"
-overrides.rocket_loader = "off"
-overrides.server_side_exclude = "off"
-overrides.ssl = "flexible"
-overrides.tls_1_2_only = "off"  # Don't force stuff.
-overrides.tls_1_3 = "zrt"  # More support (zrt = on + 0rtt)
-overrides.tls_client_auth = "off"
-overrides.visitor_ip = "on"
-overrides.waf = "off"
-overrides.websockets = "on"
-overrides.ech = "off"
-overrides.orange_to_orange = "off"
+def delete(url: str) -> Any | Literal[False]:
+    return perform("delete", url)
 
-# overrides.universal_ssl = ""
-# overrides.response_buffering = "off"
-# overrides.mirage = "off"
-# overrides.binary_ast = "off"
-# overrides.webp = "on"
 
-# Enterprise
-# overrides.advanced_ddos = "off" # Is this good? I'm not sure.
-# overrides.http2 = "on" # I like ths idea of more support.
+def get(url: str) -> Any | Literal[False]:
+    return perform("get", url)
 
-overrides.cache_level = "aggressive"
-overrides.cname_flattening = "flatten_at_root"
-overrides.min_tls_version = "1.0"  # This is supposed to be a string.
-overrides.security_level = "essentially_off"
 
-overrides.browser_cache_ttl = RESPECT_HEADERS
-overrides.challenge_ttl = ONE_WEEK
-overrides.edge_cache_ttl = TWO_HOURS
-overrides.max_upload = 100  # This is supposed to be a number for some reason.
+def patch(url: str, data: dict[str, Any]) -> Any | Literal[False]:
+    return perform("patch", url, data)
 
-overrides.minify = Table({"css": "off", "html": "off", "js": "off"})
-overrides.mobile_redirect = Table(
-    {"status": "off", "mobile_subdomain": None, "strip_uri": False}
-)
-overrides.security_header = Table(
-    {
+
+def post(url: str, data: dict[str, Any]) -> Any | Literal[False]:
+    return perform("post", url, data)
+
+
+def put(url: str, data: dict[str, Any]) -> Any | Literal[False]:
+    return perform("put", url, data)
+
+
+# Settings overrides
+overrides: dict[str, Any] = {
+    "0rtt": "on",  # Extra performance
+    "always_online": "off",  # This is cool, but bad for debugging.
+    "always_use_https": "off",  # Never always do anything.
+    "automatic_https_rewrites": "off",
+    "brotli": "on",  # Transparent
+    "browser_check": "off",
+    "development_mode": "off",
+    "early_hints": "off",
+    "email_obfuscation": "off",  # Stupid
+    "filter_logs_to_cloudflare": "off",
+    "hotlink_protection": "off",  # Stupid
+    "http3": "on",  # Support HTTP/3
+    "ip_geolocation": "on",
+    "ipv6": "on",  # Support IPv6
+    "log_to_cloudflare": "on",
+    "opportunistic_encryption": "off",
+    "opportunistic_onion": "off",
+    "pq_keyex": "off",
+    "privacy_pass": "off",
+    "pseudo_ipv4": "off",  # Pseudo-stuff isn't good.
+    "replace_insecure_js": "off",
+    "rocket_loader": "off",
+    "server_side_exclude": "off",
+    "ssl": "flexible",
+    "tls_1_2_only": "off",  # Don't force stuff.
+    "tls_1_3": "zrt",  # More support (zrt = on + 0rtt)
+    "tls_client_auth": "off",
+    "visitor_ip": "on",
+    "waf": "off",
+    "websockets": "on",
+    "ech": "off",
+    "orange_to_orange": "off",
+    "response_buffering": "off",
+    "mirage": "off",
+    "webp": "off",
+    "polish": "off",
+    "prefetch_preload": "off",
+    "http2": "on",
+    "true_client_ip_header": "off",
+    "origin_error_page_pass_thru": "off",
+    "sort_query_string_for_cache": "off",
+    "proxy_read_timeout": 100,
+    "long_lived_grpc": "off",
+    "advanced_ddos": "off",
+    "cache_level": "aggressive",
+    "cname_flattening": "flatten_at_root",
+    "min_tls_version": "1.0",  # This is supposed to be a string.
+    "security_level": "essentially_off",
+    "browser_cache_ttl": RESPECT_HEADERS,
+    "challenge_ttl": ONE_WEEK,
+    "edge_cache_ttl": TWO_HOURS,
+    "max_upload": 100,  # This is supposed to be a number for some reason.
+    "minify": {"css": "off", "html": "off", "js": "off"},
+    "mobile_redirect": {"status": "off", "mobile_subdomain": None, "strip_uri": False},
+    "security_header": {
         "strict_transport_security": {
             "enabled": False,
             "max_age": 0,
@@ -221,268 +204,293 @@ overrides.security_header = Table(
             "preload": False,
             "nosniff": False,
         }
-    }
+    },
+    "ciphers": [],
+    "origin_max_http_version": "1",
+}
+
+# Zone-specific configuration overrides
+ZONE_CONFIG: dict[str, dict[str, Any]] = {
+    "hiroshimajobnavi.com": {
+        "address": "34.111.141.225",
+        "ssl": "full",
+    },
+    "bestratereview.com": {
+        "google_verification": "1O4KHQCY_QaBmRlMHA_WUU3LGeqjmKr_4JN25L5_ybQ",
+        "mail_server": "smtp.google.com",
+    },
+    "clarkn.co.jp": {
+        "google_verification": "ZsBDgLNcr70Rc7e6dF47J7pbLp435l1CF-hHyf6EaQM",
+        "mail_server": "smtp.google.com",
+    },
+    "southtowntattoocollective.com": {
+        "redirect_to": "tattoocollectivereno.com",
+        "short_name": "tattoocollectivereno",
+    },
+    "vec4me.com": {
+        "index_redirect": True,
+    },
+}
+
+# Email routing targets by zone name
+EMAIL_TARGETS: dict[str, str] = {
+    "tattoocollectivereno.com": "tattoocollectivereno@gmail.com",
+    "southtowntattoocollective.com": "tattoocollectivereno@gmail.com",
+    "je.gy": "jeff@je.gy",
+}
+EMAIL_DEFAULT = "jeff@je.gy"
+EMAIL_BRR = "brr"
+
+# Address for brr child zones
+BRR_ADDRESS = "35.192.114.80"
+
+CLOUDFLARE_DKIM = (
+    '"v=DKIM1; h=sha256; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA'
+    'iweykoi+o48IOGuP7GR3X0MOExCUDY/BCRHoWBnh3rChl7WhdyCxW3jgq1daEjPPqoi7sJvdg5hE'
+    'QVsgVRQP4DcnQDVjGMbASQtrY4WmB1VebF+RPJB2ECPsEDTpeiI5ZyUAwJaVX7r6bznU67g7LvFq'
+    '35yIo4sdlmtZGV+i0H4cpYH9+3JJ78k" "m4KXwaf9xUJCWF6nxeD+qG6Fyruw1Qlbds2r85U9dk'
+    'NDVAS3gioCvELryh1TxKGiVTkg4wqHTyHfWsp7KD3WQHYJn0RyfJJu6YEmL77zonn7p2SRMvTMP3'
+    'ZEXibnC9gz3nnhR6wcYL8Q7zXypKTMD58bTixDSJwIDAQAB"'
 )
 
-overrides.ciphers = []
 
-
-def make_setting(zone, id=None, value=None, cloudee=None):
-    if cloudee:
-        id = cloudee.id
-        value = cloudee.value
-
-    zone = zone or print(zone.name, "setting, missing zone")
-    value = value  # or print(zone.name, "setting, missing value")
-
-    def identity():
-        return zone.name + str(id) + str(value)
-
-    def push():
-        data = {"id": id, "value": value}
-        if not patch(f"zones/{zone.id}/settings/{id}", data):
-            print(f"error {zone.name} setting {id} to {value}")
-
-    def remove():
-        pass
-        # print("you can't remove a setting lol", self)
-
-    self = Table()
-    self.id = id
-    self.identity = identity
-    self.push = push
-    self.remove = remove
-    self.type = "setting"
+def make_setting(
+    zone: dict[str, Any],
+    setting_id: str | None = None,
+    setting_value: ConfigValue = None,
+    cloudee: dict[str, Any] | None = None,
+) -> None:
+    zone_name = zone["name"]
+    zone_id = zone["id"]
 
     if cloudee:
-        cloud[identity()] = self
+        setting_id = cloudee["id"]
+        value = {k: v for k, v in cloudee.items() if k not in ("editable", "modified_on", "certificate_status", "validation_errors", "time_remaining")}
     else:
-        local[identity()] = self
+        assert setting_id is not None, f"{zone_name} setting, missing id"
+        value = {"id": setting_id, "value": setting_value}
 
-    return self
+    def push() -> None:
+        patch(f"zones/{zone_id}/settings/{setting_id}", value)
+
+    def remove() -> None:
+        pass  # can't remove a setting, only change it
+
+    path: Path = ("zones", zone_name, "settings", setting_id)  # type: ignore
+    tree = cloud if cloudee else local
+    set_tree(tree, path, value, push, remove)
 
 
-# TODO: We gotta make this handle TTL eventually.
-# Also this isn't really working how I want it to. Because SPF and Google verification records get match as the same thing and are both removed...
-def make_record(
-    zone,
-    name=None,
-    content=None,
-    type=None,
-    proxied=PROXIED,
-    priority=None,
-    ttl=AUTO,
-    id=None,
-    title=None,
-    cloudee=None,
-):
+def make_dnssec(
+    zone: dict[str, Any],
+    status: str = "disabled",
+    cloudee: dict[str, Any] | None = None,
+) -> None:
+    zone_name = zone["name"]
+    zone_id = zone["id"]
+
     if cloudee:
-        if 0 < len(cloudee.tags):
-            title = cloudee.tags[0]
-        if cloudee.name == zone.name:
+        value = {k: v for k, v in cloudee.items() if k not in ("ds", "key_tag", "algorithm", "key_type", "public_key", "digest", "digest_type", "digest_algorithm", "modified_on", "flags")}
+    else:
+        value = {"status": status}
+
+    def push() -> None:
+        patch(f"zones/{zone_id}/dnssec", value)
+
+    def remove() -> None:
+        pass  # can't remove dnssec, only change status
+
+    path: Path = ("zones", zone_name, "dnssec")
+    tree = cloud if cloudee else local
+    set_tree(tree, path, value, push, remove)
+
+
+def make_record(
+    zone: dict[str, Any],
+    name: str | None = None,
+    content: str | None = None,
+    type: str | None = None,
+    proxied: bool = PROXIED,
+    priority: int | None = None,
+    ttl: int = AUTO,
+    cloudee: dict[str, Any] | None = None,
+) -> None:
+    zone_name = zone["name"]
+    zone_id = zone["id"]
+    record_id: str | None = None
+
+    if cloudee:
+        record_id = cloudee["id"]
+        # Normalize name for the key
+        if cloudee["name"] == zone_name:
             name = ROOT
-        elif cloudee.name.endswith(f".{zone.name}"):
-            name = cloudee.name[0 : -(1 + len(zone.name))]
-        if quoted(cloudee.content):
-            content = unquote(cloudee.content)
+        elif cloudee["name"] and cloudee["name"].endswith(f".{zone_name}"):
+            name = cloudee["name"][0 : -(1 + len(zone_name))]
         else:
-            content = cloudee.content
-        ttl = int(cloudee.ttl)
-        proxied = cloudee.proxied
-        type = cloudee.type
-        priority = cloudee.priority
-        id = cloudee.id
-        # Sorry, did the API change or something? This used to be built in I thought.
+            name = cloudee["name"]
+        content = cloudee["content"]
+        type = cloudee["type"]
+        # Filter priority for MX records (managed by Email Routing)
+        skip = ("id", "zone_id", "zone_name", "created_on", "modified_on", "meta", "comment", "tags", "proxiable", "settings")
+        if cloudee["type"] == "MX":
+            skip = (*skip, "priority")
+        value = {k: v for k, v in cloudee.items() if k not in skip}
+    else:
+        assert content is not None, f"{zone_name} record, missing content"
 
-    if type == None:
-        if ipv4_address(content):
-            type = ADDRESS
-        elif weird(content):
-            type = TEXT
-        else:
-            type = CNAME
+        if type is None:
+            if ipv4_address(content):
+                type = ADDRESS
+            elif weird(content):
+                type = TEXT
+            else:
+                type = CNAME
 
-    if type == TEXT:
-        proxied = UNPROXIED
-    elif type == MAIL:
-        proxied = UNPROXIED
-        priority = 1
+        if type in (TEXT, MAIL):
+            proxied = UNPROXIED
 
-    # Prioritize zone name given that @ = zone name.
-    if name == zone.name:
-        print(f"please use @ for the record name instead of {zone.name}")
+        if name == zone_name:
+            print(f"please use @ for the record name instead of {zone_name}")
 
-    content = quote_if_weird(content)
+        content = quote_if_weird(content)
+        full_name = zone_name if name == ROOT else f"{name}.{zone_name}"
 
-    name = name or print(zone.name, "record, missing name")
-    type = type or print(zone.name, "record, missing type")
-    content = content or print(zone.name, "record, missing content")
-    proxied = proxied  # or print(zone.name, "record, missing proxied")
-    ttl = ttl or print(zone.name, "record, missing ttl")
-    priority = priority  # or print(zone.name, "record, missing priority")
-    zone = zone or print(zone.name, "record, missing zone")
+        assert name is not None, f"{zone_name} record, missing name"
+        assert type is not None, f"{zone_name} record, missing type"
 
-    # TODO
-    # def flatten(record, flatten = FLATTEN):
-    # 	data = Table({
-    # 		"flatten": flatten
-    # 	})
-
-    def proxy(on):
-        proxied = on
-
-    def identity():
-        return (
-            zone.name + name + type + content + str(proxied) + str(ttl) + str(priority)
-        )
-
-    def is_web():
-        return (type == CNAME or type == ADDRESS) and (
-            record.name == ROOT or record.name == WWW
-        )
-
-    def push():
-        data = {
-            "content": quote_if_weird(content),
-            "name": name,
+        value = {
+            "content": content,
+            "name": full_name,
             "proxied": proxied,
             "ttl": ttl,
-            "priority": priority,
             "type": type,
         }
-        if not post(f"zones/{zone.id}/dns_records", data):
-            print(f"error {zone.name} make record [{type}, {name}, {content}]")
+        # Don't include priority for MX (managed by Email Routing)
+        if priority is not None and type != MAIL:
+            value["priority"] = priority
 
-    def remove():
-        if not delete(f"zones/{zone.id}/dns_records/{id}"):
-            pass
-            # print(f"error {zone.name} remove record [{type}, {name}, {content}]")
+    def push() -> None:
+        post(f"zones/{zone_id}/dns_records", value)
 
-    self = Table()
-    self.is_web = is_web
-    self.identity = identity
-    self.push = push
-    self.remove = remove
-    self.type = "record"
+    def remove() -> None:
+        delete(f"zones/{zone_id}/dns_records/{record_id}")
+
+    path: Path = ("zones", zone_name, "records", f"{name}/{type}/{content}")
+    tree = cloud if cloudee else local
+    set_tree(tree, path, value, push, remove)
+
+
+def make_route(
+    zone: dict[str, Any],
+    pattern: str | None = None,
+    script: str | None = None,
+    cloudee: dict[str, Any] | None = None,
+) -> None:
+    zone_name = zone["name"]
+    zone_id = zone["id"]
+    route_id: str | None = None
 
     if cloudee:
-        cloud[identity()] = self
+        route_id = cloudee["id"]
+        pattern = cloudee["pattern"]
+        value = {k: v for k, v in cloudee.items() if k not in ("id", "request_limit_fail_open")}
     else:
-        local[identity()] = self
+        assert pattern is not None, f"{zone_name} route, missing pattern"
+        assert script is not None, f"{zone_name} route, missing script"
+        value = {"pattern": pattern, "script": script}
 
-    return self
+    def remove() -> None:
+        delete(f"zones/{zone_id}/workers/routes/{route_id}")
+
+    def push() -> None:
+        post(f"zones/{zone_id}/workers/routes", value)
+
+    path: Path = ("zones", zone_name, "routes", pattern)  # type: ignore
+    tree = cloud if cloudee else local
+    set_tree(tree, path, value, push, remove)
 
 
-def make_route(zone, origin=None, target=None, cloudee=None):
-    if cloudee:
-        origin = cloudee.pattern
-        target = cloudee.script
-        id = cloudee.id
-
-    origin = origin or print(zone.name, "route, missing origin")
-    target = target or print(zone.name, "route, missing target")
-
-    def remove():
-        if not delete(f"zones/{zone.id}/workers/routes/{id}"):
-            print(f"error {zone.name} remove worker route {origin}")
-
-    def push():
-        data = {"pattern": origin, "script": target}
-        if not post(f"zones/{zone.id}/workers/routes", data):
-            print(f"error {zone.name} create worker route {origin}")
-
-    def identity():
-        return zone.name + origin + str(target)
-
-    self = Table()
-    self.identity = identity
-    self.push = push
-    self.remove = remove
-    self.type = "route"
+def make_rule(
+    zone: dict[str, Any],
+    target: str | None = None,
+    enabled: bool = True,
+    cloudee: dict[str, Any] | None = None,
+) -> None:
+    zone_name = zone["name"]
+    zone_id = zone["id"]
+    rule_id: str | None = None
 
     if cloudee:
-        cloud[identity()] = self
+        rule_id = cloudee["id"]
+        actions = cloudee.get("actions", [])
+        if actions and len(actions) > 0:
+            action = actions[0]
+            if action.get("type") != "drop" and action.get("value"):
+                target = action["value"][0]
+        if target is None:
+            return  # Skip "drop" rules or rules without targets
+        value = {k: v for k, v in cloudee.items() if k not in ("id", "tag", "name", "priority")}
     else:
-        local[identity()] = self
-
-    return self
-
-
-def make_rule(zone, target=None, enabled=True, cloudee=None):
-    if cloudee:
-        target = cloudee.actions[0].type != "drop" and cloudee.actions[0].value[0]
-        enabled = cloudee.enabled  # Make sure this is working
-        id = cloudee.id
-
-    target = target or print(zone.name, "rule, missing target")
-
-    def identity():
-        return zone.name + str(target) + str(enabled)
-
-    def remove():
-        if not delete(f"zones/{zone.id}/email/routing/rules/{id}"):
-            print(f"error {zone.name} remove e-rule {target}")
-
-    def push():
-        data = {
+        if target is None:
+            return
+        value = {
             "matchers": [{"type": "all"}],
             "actions": [
                 {
-                    "type": "forward" if "@" in (target or "") else "worker",
+                    "type": "forward" if "@" in target else "worker",
                     "value": [target],
                 }
             ],
             "enabled": enabled,
         }
-        if not post(f"zones/{zone.id}/email/routing/rules", data):
-            print(f"error {zone.name} make e-rule {target}")
 
-    self = Table()
-    self.identity = identity
-    self.push = push
-    self.remove = remove
-    self.type = "rule"
+    def remove() -> None:
+        delete(f"zones/{zone_id}/email/routing/rules/{rule_id}")
+
+    def push() -> None:
+        post(f"zones/{zone_id}/email/routing/rules", value)
+
+    path: Path = ("zones", zone_name, "email_rules", target)  # type: ignore
+    tree = cloud if cloudee else local
+    set_tree(tree, path, value, push, remove)
+
+
+def make_email_routing(zone: dict[str, Any], target: str) -> None:
+    """Create email rule and required Cloudflare MX/DKIM records."""
+    make_rule(zone, target=target)
+    # Cloudflare email routing requires these MX records
+    make_record(zone, ROOT, "route1.mx.cloudflare.net", MAIL, UNPROXIED, priority=84)
+    make_record(zone, ROOT, "route2.mx.cloudflare.net", MAIL, UNPROXIED, priority=5)
+    make_record(zone, ROOT, "route3.mx.cloudflare.net", MAIL, UNPROXIED, priority=2)
+    # Cloudflare DKIM record
+    make_record(zone, "cf2024-1._domainkey", CLOUDFLARE_DKIM)
+
+
+def get_redirect_rules(zone: dict[str, Any]) -> dict[str, Any] | None:
+    return get(f"zones/{zone['id']}/rulesets/phases/http_request_dynamic_redirect/entrypoint") or None
+
+
+def make_redirect_rule(
+    zone: dict[str, Any],
+    expression: str | None = None,
+    target_url: str | None = None,
+    status_code: int = 301,
+    cloudee: dict[str, Any] | None = None,
+) -> None:
+    zone_name = zone["name"]
+    zone_id = zone["id"]
+    id: str | None = None
 
     if cloudee:
-        cloud[identity()] = self
+        expression = cloudee["expression"]
+        id = cloudee["id"]
+        # Copy exactly what Cloudflare gave us, minus id/ref/version
+        value = {k: v for k, v in cloudee.items() if k not in ("id", "ref", "version", "last_updated")}
     else:
-        local[identity()] = self
-
-    return self
-
-
-def get_redirect_rules(zone):
-    result = get(f"zones/{zone.id}/rulesets/phases/http_request_dynamic_redirect/entrypoint")
-    if result:
-        return Table(result)
-    return Table()
-
-
-def make_redirect_rule(zone, expression=None, target_url=None, status_code=301, cloudee=None):
-    if cloudee:
-        expression = cloudee.expression
-        if cloudee.action_parameters and cloudee.action_parameters.from_value:
-            target_url = cloudee.action_parameters.from_value.target_url.expression
-            status_code = cloudee.action_parameters.from_value.status_code
-        id = cloudee.id
-
-    expression = expression or print(zone.name, "redirect rule, missing expression")
-    target_url = target_url or print(zone.name, "redirect rule, missing target_url")
-
-    def identity():
-        return zone.name + "redirect" + expression + str(target_url) + str(status_code)
-
-    def remove():
-        ruleset = get_redirect_rules(zone)
-        if ruleset and ruleset.rules:
-            new_rules = [r for r in ruleset.rules if r.id != id]
-            data = {"rules": new_rules}
-            if not perform("put", f"zones/{zone.id}/rulesets/{ruleset.id}", data):
-                print(f"error {zone.name} remove redirect rule")
-
-    def push():
-        ruleset = get_redirect_rules(zone)
-        new_rule = {
+        assert expression is not None, f"{zone_name} redirect rule, missing expression"
+        assert target_url is not None, f"{zone_name} redirect rule, missing target_url"
+        # Build exactly what Cloudflare would store
+        value = {
             "expression": expression,
             "action": "redirect",
             "action_parameters": {
@@ -495,503 +503,551 @@ def make_redirect_rule(zone, expression=None, target_url=None, status_code=301, 
             "enabled": True,
         }
 
-        if ruleset and ruleset.id:
-            existing_rules = list(ruleset.rules) if ruleset.rules else []
-            existing_rules.append(new_rule)
-            data = {"rules": existing_rules}
-            if not perform("put", f"zones/{zone.id}/rulesets/{ruleset.id}", data):
-                print(f"error {zone.name} update redirect rule")
+    def remove() -> None:
+        ruleset = get_redirect_rules(zone)
+        if ruleset and ruleset.get("rules"):
+            new_rules = [r for r in ruleset["rules"] if r["id"] != id]
+            put(f"zones/{zone_id}/rulesets/{ruleset['id']}", {"rules": new_rules})
+
+    def push() -> None:
+        ruleset = get_redirect_rules(zone)
+        if ruleset and ruleset.get("id"):
+            existing_rules = list(ruleset.get("rules", []))
+            existing_rules.append(value)
+            put(f"zones/{zone_id}/rulesets/{ruleset['id']}", {"rules": existing_rules})
         else:
-            data = {
+            post(f"zones/{zone_id}/rulesets", {
                 "name": "Redirect Rules",
                 "kind": "zone",
                 "phase": "http_request_dynamic_redirect",
-                "rules": [new_rule],
-            }
-            if not post(f"zones/{zone.id}/rulesets", data):
-                print(f"error {zone.name} create redirect ruleset")
+                "rules": [value],
+            })
 
-    self = Table()
-    self.identity = identity
-    self.push = push
-    self.remove = remove
-    self.type = "redirect_rule"
-
-    if cloudee:
-        cloud[identity()] = self
-    else:
-        local[identity()] = self
-
-    return self
+    key = expression or cloudee["expression"]  # type: ignore
+    path: Path = ("zones", zone_name, "redirect_rules", key)
+    tree = cloud if cloudee else local
+    set_tree(tree, path, value, push, remove)
 
 
-def get_workers():
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts"
-    workers = Table()
+def get_workers() -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
     page = 1
-    while True:
-        response = requests.get(f"{url}?page={page}", headers=CLOUDFLARE_HEADERS).json()
-        if not response.get("success", False):
+    while page < 100:
+        data = get(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/scripts?page={page}")
+        if not data:
             break
-        workers_data = response.get("result", [])
-        for worker in workers_data:
-            workers.insert(worker)
-        result_info = response.get("result_info", {})
-        if result_info.get("page", 1) >= result_info.get("total_pages", 1):
+        before = len(result)
+        for worker in data:
+            result[worker["id"]] = worker
+        if len(result) == before:  # no new workers
             break
         page += 1
-    return workers
+    return result
 
 
-def get_worker_domains():
-    return Table(get(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/domains"))
+def get_pages() -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    page = 1
+    while page < 100:
+        data = get(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects?page={page}")
+        if not data:
+            break
+        before = len(result)
+        for p in data:
+            result[p["name"]] = p
+        if len(result) == before:  # no new pages
+            break
+        page += 1
+    return result
 
 
-def get_zones():
-    zones = Table()
+def get_worker_domains() -> list[dict[str, Any]]:
+    result = get(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/domains")
+    return result if result else []
+
+
+def get_zones() -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
     page = 1
     while data := get(f"zones?per_page=69&page={page}"):
-        for thing in data:
-            zones.insert(thing)
+        for zone in data:
+            result[zone["id"]] = zone
         if len(data) < 69:
             break
         page += 1
-    return zones
+    return result
 
 
-def fetch():
-    global cloud
-    global local
-    global zones
-    global workers
-    cloud = Table()
-    local = Table()
+def fetch_all() -> None:
+    """Fetch everything from cloud."""
+    global zones, workers, pages, cloud, missing_settings
+    cloud = {}
+    missing_settings = set()
+
+    print("  fetching zones...")
     zones = get_zones()
+    print("  fetching workers...")
     workers = get_workers()
-    for k in zones:
-        zone = zones[k]
-        records = Table(get(f"zones/{zone.id}/dns_records"))
-        routes = Table(get(f"zones/{zone.id}/workers/routes"))
-        rules = Table(get(f"zones/{zone.id}/email/routing/rules"))
-        settings = Table(get(f"zones/{zone.id}/settings"))
-        zone.records = records
-        zone.routes = routes
-        zone.rules = rules
-        zone.settings = settings
-        for k in records:
-            records[k] = make_record(zone, cloudee=records[k])
-        for k in routes:
-            routes[k] = make_route(zone, cloudee=routes[k])
-        for k in rules:
-            rules[k] = make_rule(zone, cloudee=rules[k])
-        for k in settings:
-            settings[k] = make_setting(zone, cloudee=settings[k])
+    print("  fetching pages...")
+    pages = get_pages()
+
+    # Fetch page domains
+    print("  fetching page domains...")
+    for page in pages.values():
+        domains = get(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects/{page['name']}/domains")
+        page["domains"] = domains if domains else []
+        for domain in page["domains"]:
+            make_page_domain(page["name"], cloudee=domain)
+
+    # Fetch zone details
+    print("  fetching zone details...")
+    for zone in zones.values():
+        zone_name = zone["name"]
+        zone_id = zone["id"]
+
+        records = get(f"zones/{zone_id}/dns_records") or []
+        routes = get(f"zones/{zone_id}/workers/routes") or []
+        rules = get(f"zones/{zone_id}/email/routing/rules") or []
+        settings = get(f"zones/{zone_id}/settings") or []
+        dnssec = get(f"zones/{zone_id}/dnssec") or {}
+
+        zone["records"] = {r["id"]: r for r in records}
+        zone["routes"] = {r["id"]: r for r in routes}
+        zone["rules"] = {r["id"]: r for r in rules}
+        zone["settings"] = {s["id"]: s for s in settings}
+        zone["dnssec"] = dnssec
+
+        for record in records:
+            if record["type"] == "AAAA" and record["content"].startswith("100::"):
+                continue  # Skip Cloudflare pseudo IPv6 addresses
+            make_record(zone, cloudee=record)
+        for route in routes:
+            make_route(zone, cloudee=route)
+        for rule in rules:
+            make_rule(zone, cloudee=rule)
+        for setting in settings:
+            if setting.get("editable") and setting["id"] in overrides:
+                make_setting(zone, cloudee=setting)
+            elif setting.get("editable") and setting["id"] not in overrides:
+                missing_settings.add(setting["id"])
+        if dnssec:
+            make_dnssec(zone, cloudee=dnssec)
+
         redirect_ruleset = get_redirect_rules(zone)
-        if redirect_ruleset and redirect_ruleset.rules:
-            for rule in redirect_ruleset.rules:
+        if redirect_ruleset and redirect_ruleset.get("rules"):
+            for rule in redirect_ruleset["rules"]:
                 make_redirect_rule(zone, cloudee=rule)
-    worker_domains = get_worker_domains()
-    for k in worker_domains:
-        wd = worker_domains[k]
-        for j in zones:
-            zone = zones[j]
-            if zone.id == wd.zone_id:
-                make_worker_domain(wd.service, zone, cloudee=wd)
+
+    # Fetch worker domains
+    print("  fetching worker domains...")
+    for wd in get_worker_domains():
+        for zone in zones.values():
+            if zone["id"] == wd["zone_id"]:
+                make_worker_domain(wd["service"], zone, cloudee=wd)
                 break
 
 
-def quote_if_weird(string):
+def build_local_config(used_services: set[str]) -> None:
+    """Build local (desired) configuration for all zones."""
+    global local
+    local = {}
+
+    print("  building local config...")
+    for zone in zones.values():
+        configure_email(zone)
+        configure_dns(zone)
+        configure_redirects(zone)
+        configure_domains(zone, used_services)
+        configure_settings_local(zone)
+
+
+def configure_settings_local(zone: dict[str, Any]) -> None:
+    """Build local settings config (only for settings that exist in zone)."""
+    for setting_id, setting in zone.get("settings", {}).items():
+        if setting.get("editable") and setting_id in overrides:
+            value = overrides[setting_id]
+            zone_override = get_zone_config(zone, setting_id)
+            if zone_override is not None:
+                value = zone_override
+            make_setting(zone, setting_id, value)
+    # DNSSEC should always be disabled
+    if zone.get("dnssec"):
+        make_dnssec(zone, "disabled")
+
+
+def quote_if_weird(string: str) -> str:
     if weird(string):
         return quote(string)
     return string
 
 
-def ipv4_address(string):
-    ipv4_regex = r"^(\d{1,3}\.){3}\d{1,3}$"
-    if not re.match(ipv4_regex, string):
-        return False
+def ipv4_address(string: str) -> bool:
     parts = string.split(".")
-    return all(0 <= int(part) <= 255 for part in parts)
+    return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
 
 
-def number(zone):
-    parts = zone.name.split(".")
+def number(zone: dict[str, Any]) -> bool:
+    parts = zone["name"].split(".")
     return all(part.isdigit() for part in parts[0] if part)
 
 
-def standard(zone):
-    parts = zone.name.split(".")
-    if number(zone):
-        return False
-    if len(parts) >= 2 and parts[-1] in {"com", "net", "org", "jp"}:
-        return True
-    return False
+def standard(zone: dict[str, Any]) -> bool:
+    return not number(zone) and zone["name"].split(".")[-1] in {"com", "net", "org", "jp"}
 
 
-# def short(zone):
-#    parts = zone.name.split(".")
-#    if number(zone) or len(parts) > 2:
-#        return parts[0]
-#    else:
-#        og = standard(zone)
-#        name = og and parts[0] or zone.name.replace(".", "")
-#        return name
-
-
-VOWELS = set("aeiou")
-
-
-def is_vowel(ch):
-    return ch.lower() in VOWELS
-
-
-def vowel_consonant_boundary(a, b):
+def vowel_consonant_boundary(a: str, b: str) -> bool:
     if not a or not b:
         return False
-    return is_vowel(a[-1]) != is_vowel(b[0])
+    return (a[-1].lower() in "aeiou") != (b[0].lower() in "aeiou")
 
 
-def short(zone):
-    parts = zone.name.split(".")
+def short(zone: dict[str, Any]) -> str:
+    parts = zone["name"].split(".")
 
-    # Rule 1: numeric zones -> just return first part
+    # Numeric zones -> just return first part
     if number(zone):
         return parts[0]
 
-    # Combine everything after the first part
-    rest = "".join(parts[1:])
-
-    # For exactly two parts, use your standard/og rule
-    first = parts[0]
-    og = standard(zone)
-
-    if og:
+    # Standard zones (.com, .net, .org, .jp) -> just return first part
+    if standard(zone):
         return parts[0]
 
-    base = og and first or zone.name.replace(".", "")
-
-    # Apply boundary logic between `first` and *all* remaining parts
+    # Non-standard zones: use vowel/consonant boundary logic
+    first = parts[0]
+    rest = "".join(parts[1:])
     if vowel_consonant_boundary(first, rest):
         return first + rest
-    else:
-        return first
+    return first
 
 
-def pair(zone):
-    www = f"www.{zone.name}"
-    root = zone.name
-    if standard(zone):
-        return www, root
-    else:
-        return root, www
+def pair(zone: dict[str, Any]) -> tuple[str, str]:
+    www, root = f"www.{zone['name']}", zone["name"]
+    return (www, root) if standard(zone) else (root, www)
 
 
-# TODO
-def do_world_record_and_proxys():
-    for record in records:
-        if record.is_web():
-            if record.is_a(ADDRESS):
-                record.proxy(PROXIED)
-
-
-def do_google_search_console_records():
-    for k in zones:
-        zone = zones[k]
-        make_record(zone, ROOT, os.getenv("GOOGLE_SITE_VERIFICATION"))
-
-
-def quoted(string):
+def quoted(string: str) -> bool:
     return string[0] == '"' and string[-1] == '"'
 
 
-def unquoted(string):
-    return string[0] != '"' and string[-1] != '"'
+def quote(string: str) -> str:
+    return string if quoted(string) else f'"{string}"'
 
 
-def unquote(string):
-    return quoted(string) and string[1:-1] or string
-
-
-def quote(string):
-    return unquoted(string) and f'"{string}"' or string
-
-
-# def weird(string):
-#    return bool(re.search(r"[^\w.]", string))
-
-
-def weird(string):
+def weird(string: str) -> bool:
     return "=" in string
 
 
-def domain(address):
-    parts = address.split(".")
-    if len(parts) < 2:
-        return address  # Return as-is if not a valid subdomain structure
-    return ".".join(parts[-2:])
+def brr_child(zone: dict[str, Any]) -> bool:
+    return "rate" in zone["name"] and zone["name"] != "bestratereview.com"
 
 
-def brr_child(zone):
-    return "rate" in zone.name and zone.name != "bestratereview.com"
+def zone_short_name(zone: dict[str, Any]) -> str:
+    """Get the short name used to match workers/pages for this zone."""
+    return ZONE_CONFIG.get(zone["name"], {}).get("short_name", short(zone))
 
 
-def zone_worker(zone):
-    look = short(zone)
-    if zone.name == "southtowntattoocollective.com":
-        look = "tattoocollectivereno"
-    for k in workers:
-        worker = workers[k]
-        if worker.id == look:
-            return look
+def find_service(collection: dict[str, Any], name: str, suffixes: list[str]) -> str | None:
+    """Find a service by name with optional suffixes."""
+    for suffix in suffixes:
+        key = f"{name}{suffix}" if suffix else name
+        if key in collection:
+            return key
+    return None
 
 
-def zone_type(zone):
-    """Returns 'worker' or None based on what serves this zone."""
+def zone_worker(zone: dict[str, Any]) -> str | None:
+    """Returns the worker id if this zone is served by a Worker."""
+    return find_service(workers, zone_short_name(zone), ["", "-website"])
+
+
+def zone_page(zone: dict[str, Any]) -> str | None:
+    """Returns the page id if this zone is served by a Page."""
+    return find_service(pages, zone_short_name(zone), ["", "-website"])
+
+
+def zone_api_worker(zone: dict[str, Any]) -> str | None:
+    """Returns the API worker id (-api suffix, or exact match fallback)."""
+    return find_service(workers, zone_short_name(zone), ["-api", ""])
+
+
+def zone_type(zone: dict[str, Any]) -> Literal["worker", "page"] | None:
+    """Returns 'worker', 'page', or None based on what serves this zone."""
     if zone_worker(zone):
         return "worker"
+    if zone_page(zone):
+        return "page"
     return None  # Falls back to VPS/origin
 
 
-def make_worker_domain(worker_name, zone, hostname=None, cloudee=None):
+def make_page_domain(
+    page_name: str,
+    hostname: str | None = None,
+    cloudee: dict[str, Any] | None = None,
+) -> None:
     if cloudee:
-        hostname = cloudee.hostname
-        id = cloudee.id
+        hostname = cloudee["name"]
+        value = {k: v for k, v in cloudee.items() if k not in ("id", "created_on", "status", "validation_data", "verification_data", "domain_id", "certificate_authority", "zone_tag")}
+    else:
+        assert hostname is not None, f"{page_name} page domain, missing hostname"
+        value = {"name": hostname}
 
-    hostname = hostname or print(worker_name, "worker domain, missing hostname")
+    def remove() -> None:
+        delete(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects/{page_name}/domains/{hostname}")
 
-    def identity():
-        return worker_name + hostname
+    def push() -> None:
+        post(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects/{page_name}/domains", value)
 
-    def remove():
-        if not delete(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/domains/{id}"):
-            print(f"error {worker_name} remove worker domain {hostname}")
+    path: Path = ("page_domains", page_name, hostname)  # type: ignore
+    tree = cloud if cloudee else local
+    set_tree(tree, path, value, push, remove)
 
-    def push():
-        data = {
+
+def make_worker_domain(
+    worker_name: str,
+    zone: dict[str, Any],
+    hostname: str | None = None,
+    cloudee: dict[str, Any] | None = None,
+) -> None:
+    zone_id = zone["id"]
+    domain_id: str | None = None
+
+    if cloudee:
+        domain_id = cloudee["id"]
+        hostname = cloudee["hostname"]
+        value = {k: v for k, v in cloudee.items() if k not in ("id", "zone_name", "cert_id")}
+    else:
+        assert hostname is not None, f"{worker_name} worker domain, missing hostname"
+        value = {
             "hostname": hostname,
-            "zone_id": zone.id,
+            "zone_id": zone_id,
             "service": worker_name,
             "environment": "production",
         }
-        if not perform("put", f"accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/domains", data):
-            print(f"error {worker_name} make worker domain {hostname}")
 
-    self = Table()
-    self.identity = identity
-    self.push = push
-    self.remove = remove
-    self.type = "worker_domain"
+    def remove() -> None:
+        delete(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/domains/{domain_id}")
 
-    if cloudee:
-        cloud[identity()] = self
+    def push() -> None:
+        put(f"accounts/{CLOUDFLARE_ACCOUNT_ID}/workers/domains", value)
+
+    path: Path = ("worker_domains", hostname)  # type: ignore
+    tree = cloud if cloudee else local
+    set_tree(tree, path, value, push, remove)
+
+
+def get_cloud_node(path: Path) -> LeafNode | None:
+    """Get the cloud node at a path."""
+    tree = cloud
+    for key in path[:-1]:
+        if key not in tree:
+            return None
+        tree = tree[key]  # type: ignore
+    node = tree.get(path[-1])
+    return node if node and "value" in node else None  # type: ignore
+
+
+def run_deltas() -> None:
+    diffs: list[Diff] = list(diff_trees(cloud, local))
+
+    if not diffs:
+        print("no changes")
+        return
+
+    for action, path, node in diffs:
+        path_str = "/".join(path)
+        if action == "remove":
+            print(f"remove: {path_str}")
+        elif action == "push":
+            print(f"push: {path_str} = {node['value']}")
+        elif action == "update":
+            cloud_node = get_cloud_node(path)
+            print(f"update: {path_str}")
+            print(f"  cloud: {cloud_node['value'] if cloud_node else None}")
+            print(f"  local: {node['value']}")
+
+    confirm = input("\nproceed with writes? [y/N] ")
+    if confirm.lower() != "y":
+        print("aborted")
+        return
+
+    for action, path, node in diffs:
+        if action == "remove":
+            node["remove"]()
+        elif action == "push":
+            node["push"]()
+        elif action == "update":
+            # For updates: remove old, then push new
+            cloud_node = get_cloud_node(path)
+            if cloud_node:
+                cloud_node["remove"]()
+            node["push"]()
+
+
+def get_zone_config(zone: dict[str, Any], key: str, default: Any = None) -> Any:
+    """Get a zone-specific config value, or default if not set."""
+    return ZONE_CONFIG.get(zone["name"], {}).get(key, default)
+
+
+def configure_email(zone: dict[str, Any]) -> None:
+    """Configure email routing for a zone."""
+    config = ZONE_CONFIG.get(zone["name"], {})
+
+    # Zones with custom mail servers (Google Workspace, etc.) don't use Cloudflare email routing
+    if "mail_server" in config:
+        if "google_verification" in config:
+            make_record(zone, ROOT, f"google-site-verification={config['google_verification']}")
+        make_record(zone, ROOT, config["mail_server"], MAIL, UNPROXIED, priority=1)
+        return
+
+    # Determine email target
+    if brr_child(zone):
+        target = EMAIL_BRR
     else:
-        local[identity()] = self
+        target = EMAIL_TARGETS.get(zone["name"], EMAIL_DEFAULT)
 
-    return self
-
-
-# Brianna Flores is the persona we'll go with for now.
-HOOK_NAME = "Brianna Flores"
-HOOK_DN = HOOK_NAME.split(" ")[0].lower()
-
-# SMARTLEAD_API_KEY = os.getenv("SMARTLEAD_API_KEY")
-
-# def get_smartlead_entries():
-# 	url = f"https://server.smartlead.ai/api/v1/email-accounts/?api_k={SMARTLEAD_API_KEY}&offset=0&limit=10"
-# 	headers = Table({"Content-Type": "application/json"})
-# 	response = requests.get(url, headers = headers)
-# 	return response.json()
-
-# smartlead_entries = get_smartlead_entries()
-
-# def get_smartlead_entry_id_from_email(email):
-# 	for smartlead_entry in smartlead_entries:
-# 		if smartlead_entry.from_email == email:
-# 			return smartlead_entry.id
-
-# def make_smartlead_email(email):
-# 	url = f"https://server.smartlead.ai/api/email-account/save-email-account"
-# 	data = Table({
-# 		"fromName": HOOK_NAME,
-# 		"fromEmail": email,
-# 		"username": "apik",
-# 		"password": os.getenv("SENDGRID_API_KEY"),
-# 		"host": "smtp.sendgrid.net",
-# 		"port": 465,
-# 		"portType": "SSL",
-# 		"messagePerDay": 21,
-# 		"imapHost": "imap.mail.me.com",
-# 		"imapPort": 993,
-# 		"imapPortType": "SSL",
-# 		"isDifferentImapAccount": True,
-# 		"signature": None,
-# 		"bccEmail": None,
-# 		"imapUsername": "jeff@je.gy",
-# 		"imapPassword": os.getenv("ICLOUD_PASSWORD"),
-# 		"differentReplyToAddress": email,
-# 		"customTrackingDomain": "",
-# 		"minTimeToWaitInMins": None,
-# 	})
-# 	id = get_smartlead_entry_id_from_email(email)
-# 	if id != None:
-# 		data.id = id
-# 	# TODO: We need to automate getting the authorization header.
-# 	headers = Table({
-# 		"Content-Type": "application/json",
-# 		"Authorization": f"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjp7ImVtYWlsIjoiamVmZkBqZS5neSIsImlkIjo3NjkwMSwibmFtZSI6IkplZmZyZXkgU2tpbm5lciIsInV1aWQiOiI2NGQ2MjMxZS1kNjg3LTRhYmQtYTljNi1jYzdkMGQwNmUzYWYiLCJyb2xlIjoiYWRtaW4iLCJwcm92aWRlciI6ImFwcCJ9LCJodHRwczovL2hhc3VyYS5pby9qd3QvY2xhaW1zIjp7IngtaGFzdXJhLWFsbG93ZWQtcm9sZXMiOlsidXNlcnMiXSwieC1oYXN1cmEtZGVmYXVsdC1yb2xlIjoidXNlcnMiLCJ4LWhhc3VyYS11c2VyLWlkIjoiNzY5MDEiLCJ4LWhhc3VyYS11c2VyLXV1aWQiOiI2NGQ2MjMxZS1kNjg3LTRhYmQtYTljNi1jYzdkMGQwNmUzYWYiLCJ4LWhhc3VyYS11c2VyLW5hbWUiOiJKZWZmcmV5IFNraW5uZXIiLCJ4LWhhc3VyYS11c2VyLXJvbGUiOiJhZG1pbiIsIngtaGFzdXJhLXVzZXItZW1haWwiOiJqZWZmQGplLmd5In0sImlhdCI6MTczMjQ2MzU4MH0.v0fN8-CGW0eqOIDW9y3fZ5EFne7PVQGjHNkQ7_XdMj0"
-# 	})
-# 	response = requests.post(url, headers = headers, data = json.dumps(data))
-# 	print(response.json())
-
-def run_deltas():
-    for identity in cloud:
-        if not local.get(identity):
-            cloud[identity].remove()
-    for identity in local:
-        if not cloud.get(identity):
-            local[identity].push()
+    make_email_routing(zone, target=target)
 
 
-if __name__ == "__main__":
-    fetch()
+def configure_dns(zone: dict[str, Any]) -> None:
+    """Configure DNS records for a zone."""
+    ztype = zone_type(zone)
+    first, second = pair(zone)
 
-    for k in zones:
-        zone = zones[k]
-        first, second = pair(zone)
-
-        # if not patch(f"zones/{zone.id}/analytics/dashboard", {"enabled": True}):
-        # 	print(f"error {zone.name} enable analytics")
-        if not patch(f"zones/{zone.id}/dnssec", {"status": "disabled"}):
-            print(f"error {zone.name} dnssec")
-        if not patch(
-            f"zones/{zone.id}/settings/origin_max_http_version", {"value": "1"}
-        ):
-            print(f"error {zone.name} origin_max_http_version")
-        # if not put(f"zones/{zone.id}/url_normalization", {"scope": "incoming", "type": "rfc3986"}):
-        # 	print(f"error {zone.name} url_normalization")
-
-        # Records
-        if brr_child(zone):
-            make_rule(zone, "brr")
-        elif zone.name == "bestratereview.com":
-            make_record(
-                zone,
-                ROOT,
-                "google-site-verification=1O4KHQCY_QaBmRlMHA_WUU3LGeqjmKr_4JN25L5_ybQ",
-            )
-            make_record(zone, ROOT, "smtp.google.com", MAIL, UNPROXIED, priority=1)
-        elif (
-            zone.name == "tattoocollectivereno.com"
-            or zone.name == "southtowntattoocollective.com"
-        ):
-            make_rule(zone, target="tattoocollectivereno@gmail.com")
-        elif zone.name == "je.gy":
-            make_rule(zone, target="jeff@je.gy")
-        else:
-            make_rule(zone, target="jeff@je.gy")
-
-        if zone.name == "clarkn.co.jp":
-            make_record(
-                zone,
-                ROOT,
-                "google-site-verification=ZsBDgLNcr70Rc7e6dF47J7pbLp435l1CF-hHyf6EaQM",
-            )
-            make_record(zone, ROOT, "smtp.google.com", MAIL, UNPROXIED, priority=1)
-
-        if zone.name == "hiroshimajobnavi.com":
-            address = "34.111.141.225"
-        elif "rate" in zone.name:
-            address = "35.192.114.80"
+    # Determine address
+    address = get_zone_config(zone, "address")
+    if not address:
+        if "rate" in zone["name"]:
+            address = BRR_ADDRESS
         else:
             address = VPS
 
-        ztype = zone_type(zone)
+    # DNS records for root/www (only for zones not served by workers/pages)
+    if ztype not in ("worker", "page"):
+        if standard(zone):
+            make_record(zone, WWW, address)
+            make_record(zone, ROOT, address)
+        else:
+            make_record(zone, ROOT, address)
+            make_record(zone, WWW, address)
 
-        # DNS records for root/www (only for non-worker zones)
-        # Workers use worker domains instead of DNS records
-        if ztype != "worker":
-            if standard(zone):
-                make_record(zone, WWW, address)
-                make_record(zone, ROOT, address)
-            else:
-                make_record(zone, ROOT, address)
-                make_record(zone, WWW, address)
+    # Mail records (SPF, DMARC)
+    make_record(
+        zone,
+        ROOT,
+        "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com ~all",
+    )
+    make_record(zone, "_dmarc", "v=DMARC1; p=quarantine;")
 
-        # Mail stuff
-        make_record(
-            zone,
-            ROOT,
-            "v=spf1 include:icloud.com include:_spf.mx.cloudflare.net include:_spf.google.com ~all",
-        )
-        make_record(zone, "_dmarc", "v=DMARC1; p=quarantine;")
-        # make_record(zone, "_mailchannels", f"v=mc1 auth={os.getenv("MAILCHANNELS_ID")}", title = "mailchannels")
-        # TODO: We also need to make DKIM records.
+    # Mail tracking (unsubscribes, etc.)
+    make_record(zone, "mail", "mail.vec4me.workers.dev")
+    make_route(zone, f"mail.{zone['name']}/unsubscribe*", "mail")
 
-        # Mail tracking (unsubscribes, etc.)
-        make_record(zone, "mail", "mail.vec4me.workers.dev")
-        make_route(zone, f"mail.{zone.name}/unsubscribe*", "mail")
+    # API subdomain (for zones with a corresponding -api worker)
+    api_worker = zone_api_worker(zone)
+    if api_worker:
+        make_record(zone, "api", f"{api_worker}.vec4me.workers.dev")
+        make_route(zone, f"api.{zone['name']}/*", api_worker)
 
-        # Redirect rules
+
+def configure_redirects(zone: dict[str, Any]) -> None:
+    """Configure redirect rules for a zone."""
+    first, second = pair(zone)
+    config = ZONE_CONFIG.get(zone["name"], {})
+
+    # Standard redirects: second -> first, fbclid cleanup
+    make_redirect_rule(
+        zone,
+        f'(http.host eq "{second}")',
+        f'concat("https://{first}", http.request.uri.path)'
+    )
+    make_redirect_rule(
+        zone,
+        f'(http.host eq "{first}" and starts_with(http.request.uri.path, "/fbclid"))',
+        f'concat("https://{first}/", "")'
+    )
+
+    # Zone-specific redirects
+    if config.get("index_redirect"):
         make_redirect_rule(
             zone,
-            f'(http.host eq "{second}")',
-            f'concat("https://{first}", http.request.uri.path)'
+            f'(http.host eq "{first}" and http.request.uri.path eq "/")',
+            f'concat("https://{first}/index.htm", "")'
+        )
+    elif "redirect_to" in config:
+        target = config["redirect_to"]
+        make_redirect_rule(
+            zone,
+            f'(http.host eq "www.{zone["name"]}")',
+            f'concat("https://www.{target}", http.request.uri.path)'
         )
         make_redirect_rule(
             zone,
-            f'(http.host eq "{first}" and starts_with(http.request.uri.path, "/fbclid"))',
-            f'"https://{first}/"'
-        )  # This fixes the Instagram redirect thing.
-        if zone.name == "vec4me.com":
-            make_redirect_rule(
-                zone,
-                f'(http.host eq "{first}" and http.request.uri.path eq "/")',
-                f'"https://{first}/index.htm"'
-            )
-        elif brr_child(zone):
-            make_redirect_rule(
-                zone,
-                f'(http.host eq "www.{zone.name}")',
-                f'concat("https://www.bestratereview.com", http.request.uri.path)'
-            )
-            make_redirect_rule(
-                zone,
-                f'(http.host eq "{zone.name}")',
-                f'concat("https://bestratereview.com", http.request.uri.path)'
-            )
-        elif zone.name == "southtowntattoocollective.com":
-            make_redirect_rule(
-                zone,
-                f'(http.host eq "www.{zone.name}")',
-                'concat("https://www.tattoocollectivereno.com", http.request.uri.path)'
-            )
-            make_redirect_rule(
-                zone,
-                f'(http.host eq "{zone.name}")',
-                'concat("https://tattoocollectivereno.com", http.request.uri.path)'
-            )
+            f'(http.host eq "{zone["name"]}")',
+            f'concat("https://{target}", http.request.uri.path)'
+        )
+    elif brr_child(zone):
+        make_redirect_rule(
+            zone,
+            f'(http.host eq "www.{zone["name"]}")',
+            'concat("https://www.bestratereview.com", http.request.uri.path)'
+        )
+        make_redirect_rule(
+            zone,
+            f'(http.host eq "{zone["name"]}")',
+            'concat("https://bestratereview.com", http.request.uri.path)'
+        )
 
-        print(short(zone), ztype or "origin")
 
-        # Worker domains (only for pure worker zones - these serve the main domain)
-        worker = zone_worker(zone)
-        if ztype == "worker":
-            make_worker_domain(worker, zone, first)
-            make_worker_domain(worker, zone, second)
+def configure_domains(zone: dict[str, Any], used_services: set[str]) -> None:
+    """Configure worker/page domains for a zone."""
+    ztype = zone_type(zone)
+    first, second = pair(zone)
 
-        # Settings
-        for j in zone.settings:
-            setting = zone.settings[j]
-            if setting.editable:
-                make_setting(zone, setting.id, overrides[setting.id])
+    # Meet subdomain (all zones)
+    make_worker_domain("clarkn-meet", zone, f"meet.{zone['name']}")
 
-        # API routes (only for zones with a worker)
-        if ztype == "worker":
-            make_record(zone, "api", f"{short(zone)}.vec4me.workers.dev")
-            make_route(zone, f"api.{zone.name}/*", f"{short(zone)}")
+    # Track API worker as used
+    api_worker = zone_api_worker(zone)
+    if api_worker:
+        used_services.add(api_worker)
 
-        # Forward should really be called lint URL or something different.
-        # URL linter route
-        # make_route(zone, f"{first}/*", "forward")
+    # Worker domains
+    worker = zone_worker(zone)
+    if worker:
+        used_services.add(worker)
+    if ztype == "worker" and worker:
+        make_worker_domain(worker, zone, first)
+        make_worker_domain(worker, zone, second)
 
+    # Page domains
+    page = zone_page(zone)
+    if page:
+        used_services.add(page)
+    if ztype == "page" and page:
+        make_page_domain(page, first)
+        make_page_domain(page, second)
+
+
+if __name__ == "__main__":
+    print("starting...")
+    used_services: set[str] = set()
+
+    # Step 1: Fetch everything from cloud
+    fetch_all()
+    print(f"fetched {len(zones)} zones, {len(workers)} workers, {len(pages)} pages")
+
+    # Step 2: Build local (desired) config
+    build_local_config(used_services)
+
+    # Report missing/unused configuration
+    for setting_id in sorted(missing_settings):
+        print(f"missing setting: {setting_id}")
+    for worker_id in workers:
+        if worker_id not in used_services:
+            print(f"unused worker: {worker_id}")
+    for page_name in pages:
+        if page_name not in used_services:
+            print(f"unused page: {page_name}")
+
+    # Step 3: Show diffs and optionally apply
     run_deltas()
