@@ -236,7 +236,7 @@ ZONE_CONFIG: dict[str, dict[str, Any]] = {
 EMAIL_TARGETS: dict[str, str] = {
     "tattoocollectivereno.com": "tattoocollectivereno@gmail.com",
     "southtowntattoocollective.com": "tattoocollectivereno@gmail.com",
-    "je.gy": "jeff@je.gy",
+    "je.gy": "vec4me@icloud.com",
 }
 EMAIL_DEFAULT = "jeff@je.gy"
 EMAIL_BRR = "brr"
@@ -921,8 +921,19 @@ def configure_dns(zone: dict[str, Any]) -> None:
         else:
             address = VPS
 
-    # DNS records for root/www (only for zones not served by workers/pages)
-    if ztype not in ("worker", "page"):
+    # DNS records for root/www
+    if ztype == "page":
+        # Pages need CNAME records pointing to pages.dev
+        # Use short name (without -website suffix) for the pages.dev target
+        pages_target = f"{zone_short_name(zone)}.pages.dev"
+        if standard(zone):
+            make_record(zone, WWW, pages_target)
+            make_record(zone, ROOT, pages_target)
+        else:
+            make_record(zone, ROOT, pages_target)
+            make_record(zone, WWW, pages_target)
+    elif ztype != "worker":
+        # Workers Domains API handles DNS automatically; VPS zones need A records
         if standard(zone):
             make_record(zone, WWW, address)
             make_record(zone, ROOT, address)
