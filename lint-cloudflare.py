@@ -85,7 +85,6 @@ def diff_trees(
 
 
 # DNS constants
-ADDRESS, CNAME, TEXT, MAIL = "A", "CNAME", "TXT", "MX"
 PROXIED, UNPROXIED = True, False
 ROOT, WWW = "@", "www"
 AUTO, RESPECT_HEADERS = 1, 0
@@ -215,6 +214,9 @@ ZONE_CONFIG: dict[str, dict[str, Any]] = {
         "address": "34.111.141.225",
         "ssl": "full",
     },
+    "notatel.com": {
+        "sip_server": "sip.telnyx.com",
+    },
     "bestratereview.com": {
         "google_verification": "1O4KHQCY_QaBmRlMHA_WUU3LGeqjmKr_4JN25L5_ybQ",
         "mail_server": "smtp.google.com",
@@ -340,13 +342,13 @@ def make_record(
 
         if type is None:
             if ipv4_address(content):
-                type = ADDRESS
+                type = "A"
             elif weird(content):
-                type = TEXT
+                type = "TXT"
             else:
-                type = CNAME
+                type = "CNAME"
 
-        if type in (TEXT, MAIL):
+        if type in ("TXT", "MX"):
             proxied = UNPROXIED
 
         if name == zone_name:
@@ -366,7 +368,7 @@ def make_record(
             "type": type,
         }
         # Don't include priority for MX (managed by Email Routing)
-        if priority is not None and type != MAIL:
+        if priority is not None and type != "MX":
             value["priority"] = priority
 
     def push() -> None:
@@ -376,6 +378,73 @@ def make_record(
         delete(f"zones/{zone_id}/dns_records/{record_id}")
 
     path: Path = ("zones", zone_name, "records", f"{name}/{type}/{content}")
+    tree = cloud if cloudee else local
+    set_tree(tree, path, value, push, remove)
+
+
+def make_srv_record(
+    zone: dict[str, Any],
+    service: str,
+    proto: str,
+    target: str,
+    port: int,
+    priority: int = 10,
+    weight: int = 10,
+    cloudee: dict[str, Any] | None = None,
+) -> None:
+    """Create an SRV record for service discovery."""
+    zone_name = zone["name"]
+    zone_id = zone["id"]
+    record_id: str | None = None
+
+    name = f"{service}.{proto}"
+
+    if cloudee:
+        record_id = cloudee["id"]
+        name = cloudee["name"].replace(f".{zone_name}", "")
+        # Parse service and proto from name (e.g., "_sip._udp" -> "_sip", "_udp")
+        parts = name.split(".")
+        service = parts[0] if len(parts) > 0 else ""
+        proto = parts[1] if len(parts) > 1 else ""
+        target = cloudee["data"]["target"]
+        # Reconstruct full data to match local structure
+        value = {
+            "name": cloudee["name"],
+            "type": cloudee["type"],
+            "data": {
+                "service": service,
+                "proto": proto,
+                "name": zone_name,
+                "priority": cloudee["data"]["priority"],
+                "weight": cloudee["data"]["weight"],
+                "port": cloudee["data"]["port"],
+                "target": target,
+            },
+            "ttl": cloudee["ttl"],
+        }
+    else:
+        value = {
+            "name": f"{name}.{zone_name}",
+            "type": "SRV",
+            "data": {
+                "service": service,
+                "proto": proto,
+                "name": zone_name,
+                "priority": priority,
+                "weight": weight,
+                "port": port,
+                "target": target,
+            },
+            "ttl": AUTO,
+        }
+
+    def push() -> None:
+        post(f"zones/{zone_id}/dns_records", value)
+
+    def remove() -> None:
+        delete(f"zones/{zone_id}/dns_records/{record_id}")
+
+    path: Path = ("zones", zone_name, "records", f"{name}/SRV/{target}")
     tree = cloud if cloudee else local
     set_tree(tree, path, value, push, remove)
 
@@ -459,9 +528,9 @@ def make_email_routing(zone: dict[str, Any], target: str) -> None:
     """Create email rule and required Cloudflare MX/DKIM records."""
     make_rule(zone, target=target)
     # Cloudflare email routing requires these MX records
-    make_record(zone, ROOT, "route1.mx.cloudflare.net", MAIL, UNPROXIED, priority=84)
-    make_record(zone, ROOT, "route2.mx.cloudflare.net", MAIL, UNPROXIED, priority=5)
-    make_record(zone, ROOT, "route3.mx.cloudflare.net", MAIL, UNPROXIED, priority=2)
+    make_record(zone, ROOT, "route1.mx.cloudflare.net", "MX", UNPROXIED, priority=84)
+    make_record(zone, ROOT, "route2.mx.cloudflare.net", "MX", UNPROXIED, priority=5)
+    make_record(zone, ROOT, "route3.mx.cloudflare.net", "MX", UNPROXIED, priority=2)
     # Cloudflare DKIM record
     make_record(zone, "cf2024-1._domainkey", CLOUDFLARE_DKIM)
 
@@ -620,7 +689,10 @@ def fetch_all() -> None:
         for record in records:
             if record["type"] == "AAAA" and record["content"].startswith("100::"):
                 continue  # Skip Cloudflare pseudo IPv6 addresses
-            make_record(zone, cloudee=record)
+            if record["type"] == "SRV":
+                make_srv_record(zone, "", "", "", 0, cloudee=record)
+            else:
+                make_record(zone, cloudee=record)
         for route in routes:
             make_route(zone, cloudee=route)
         for rule in rules:
@@ -896,7 +968,7 @@ def configure_email(zone: dict[str, Any]) -> None:
     if "mail_server" in config:
         if "google_verification" in config:
             make_record(zone, ROOT, f"google-site-verification={config['google_verification']}")
-        make_record(zone, ROOT, config["mail_server"], MAIL, UNPROXIED, priority=1)
+        make_record(zone, ROOT, config["mail_server"], "MX", UNPROXIED, priority=1)
         return
 
     # Determine email target
@@ -958,6 +1030,12 @@ def configure_dns(zone: dict[str, Any]) -> None:
     if api_worker:
         make_record(zone, "api", f"{api_worker}.vec4me.workers.dev")
         make_route(zone, f"api.{zone['name']}/*", api_worker)
+
+    # SIP server (for VoIP zones)
+    sip_server = get_zone_config(zone, "sip_server")
+    if sip_server:
+        make_record(zone, "sip", sip_server, "CNAME", UNPROXIED)
+        make_srv_record(zone, "_sip", "_udp", f"sip.{zone['name']}", port=5060)
 
 
 def configure_redirects(zone: dict[str, Any]) -> None:
