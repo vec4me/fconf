@@ -61,11 +61,6 @@ def perform(
     raise RuntimeError(msg)
 
 
-def get(url: str) -> object:
-    """Send a GET request."""
-    return perform("get", url)
-
-
 def patch(url: str, data: dict[str, object]) -> object:
     """Send a PATCH request."""
     return perform("patch", url, data)
@@ -116,25 +111,16 @@ def domain_value(domain: dict[str, object]) -> dict[str, object]:
 # Resource makers
 def build_domain_value(
     *,
-    auto_renew: bool | None = None,
+    auto_renew: bool = True,
     nameservers: list[str] | None = None,
     contacts: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a domain value dict from explicit arguments."""
-    value: dict[str, object] = {}
-    if auto_renew is not None:
-        value["autoRenew"] = auto_renew
-    else:
-        value["autoRenew"] = True
-    if nameservers is not None:
-        value["nameservers"] = sorted(nameservers)
-    else:
-        value["nameservers"] = []
-    if contacts is not None:
-        value["contacts"] = contacts
-    else:
-        value["contacts"] = {}
-    return value
+    return {
+        "autoRenew": auto_renew,
+        "nameservers": sorted(nameservers) if nameservers else [],
+        "contacts": contacts if contacts is not None else {},
+    }
 
 
 def make_domain(    tree: ConfigTree,
@@ -143,13 +129,13 @@ def make_domain(    tree: ConfigTree,
     auto_renew: bool | None = None,
     nameservers: list[str] | None = None,
     contacts: dict[str, object] | None = None,
-    cloudee: dict[str, object] | None = None,
+    remote_data: dict[str, object] | None = None,
 ) -> None:
     """Build a domain node in the config tree."""
     from provider import set_tree
-    if cloudee:
-        name = str(cloudee["name"])
-        value = domain_value(cloudee)
+    if remote_data:
+        name = str(remote_data["name"])
+        value = domain_value(remote_data)
     else:
         if name is None:
             msg = "domain name is required"
@@ -161,14 +147,11 @@ def make_domain(    tree: ConfigTree,
         )
 
     def push() -> None:
-        update: dict[str, object] = {}
-        if "autoRenew" in value:
-            update["autoRenew"] = value["autoRenew"]
-        if "nameservers" in value:
-            update["nameservers"] = {"provider": None, "list": value["nameservers"]}
-        if "contacts" in value:
-            update["contacts"] = value["contacts"]
-        patch(f"v1/domains/{name}", update)
+        patch(f"v1/domains/{name}", {
+            "autoRenew": value["autoRenew"],
+            "nameservers": {"provider": None, "list": value["nameservers"]},
+            "contacts": value["contacts"],
+        })
 
     def remove() -> None:
         pass  # can't delete a domain via API
@@ -177,17 +160,17 @@ def make_domain(    tree: ConfigTree,
     set_tree(tree, path, value, push, remove)
 
 
-# Fetch cloud state
+# Fetch remote state
 def fetch_all() -> ConfigTree:
-    """Fetch all domains from Regery. Returns cloud tree."""
-    cloud: ConfigTree = {}
+    """Fetch all domains from Regery. Returns remote tree."""
+    remote: ConfigTree = {}
 
     logger.info("  fetching domains...")
     domains = paginate("v1/domains")
 
     for domain in domains:
-        make_domain(cloud, cloudee=domain)
+        make_domain(remote, remote_data=domain)
 
     logger.info("  %d domains", len(domains))
 
-    return cloud
+    return remote

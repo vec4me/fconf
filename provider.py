@@ -71,43 +71,43 @@ def diff_one_sided(
 
 
 def diff_shared_key(
-    cloud_node: ConfigTree | LeafNode,
+    remote_node: ConfigTree | LeafNode,
     local_node: ConfigTree | LeafNode,
     key: str,
     path: Path,
 ) -> Generator[Diff, None, None]:
     """Yield diffs for a key present in both trees."""
-    if is_leaf(cloud_node) and is_leaf(local_node):
-        if cloud_node["value"] != local_node["value"]:
+    if is_leaf(remote_node) and is_leaf(local_node):
+        if remote_node["value"] != local_node["value"]:
             yield ("update", (*path, key), as_leaf(local_node))
-    elif not is_leaf(cloud_node) and not is_leaf(local_node):
-        yield from diff_trees(as_tree(cloud_node), as_tree(local_node), (*path, key))
+    elif not is_leaf(remote_node) and not is_leaf(local_node):
+        yield from diff_trees(as_tree(remote_node), as_tree(local_node), (*path, key))
     else:
-        if is_leaf(cloud_node):
-            yield ("remove", (*path, key), as_leaf(cloud_node))
+        if is_leaf(remote_node):
+            yield ("remove", (*path, key), as_leaf(remote_node))
         if is_leaf(local_node):
             yield ("push", (*path, key), as_leaf(local_node))
 
 
 def diff_trees(
-    cloud: ConfigTree,
+    remote: ConfigTree,
     local: ConfigTree,
     path: Path = (),
 ) -> Generator[Diff, None, None]:
     """Yield diffs between two config trees."""
-    cloud_keys = set(cloud.keys())
+    remote_keys = set(remote.keys())
     local_keys = set(local.keys())
 
-    yield from diff_one_sided(cloud, "remove", cloud_keys - local_keys, path)
-    yield from diff_one_sided(local, "push", local_keys - cloud_keys, path)
+    yield from diff_one_sided(remote, "remove", remote_keys - local_keys, path)
+    yield from diff_one_sided(local, "push", local_keys - remote_keys, path)
 
-    for key in cloud_keys & local_keys:
-        yield from diff_shared_key(cloud[key], local[key], key, path)
+    for key in remote_keys & local_keys:
+        yield from diff_shared_key(remote[key], local[key], key, path)
 
 
-def get_node(cloud: ConfigTree, path: Path) -> LeafNode | None:
-    """Retrieve a leaf node from the cloud tree by path."""
-    tree = cloud
+def get_node(remote: ConfigTree, path: Path) -> LeafNode | None:
+    """Retrieve a leaf node from the remote tree by path."""
+    tree = remote
     for key in path[:-1]:
         if key not in tree:
             return None
@@ -129,7 +129,7 @@ def dict_delta(old: dict[str, object], new: dict[str, object]) -> list[str]:
     return changes
 
 
-def log_diffs(diffs: list[Diff], cloud: ConfigTree) -> None:
+def log_diffs(diffs: list[Diff], remote: ConfigTree) -> None:
     """Log all pending diffs for user review."""
     for action, path, node in diffs:
         path_str = "/".join(path)
@@ -138,17 +138,17 @@ def log_diffs(diffs: list[Diff], cloud: ConfigTree) -> None:
         elif action == "push":
             logger.info("push: %s = %s", path_str, node["value"])
         elif action == "update":
-            cloud_node = get_node(cloud, path)
+            remote_node = get_node(remote, path)
             logger.info("update: %s", path_str)
-            if cloud_node:
-                for change in dict_delta(cloud_node["value"], node["value"]):
+            if remote_node:
+                for change in dict_delta(remote_node["value"], node["value"]):
                     logger.info("%s", change)
         else:
             msg = f"unknown action: {action}"
             raise ValueError(msg)
 
 
-def apply_diffs(diffs: list[Diff], cloud: ConfigTree) -> None:
+def apply_diffs(diffs: list[Diff], remote: ConfigTree) -> None:
     """Apply all diffs by calling push/remove callbacks."""
     for action, path, node in diffs:
         if action == "remove":
@@ -156,28 +156,28 @@ def apply_diffs(diffs: list[Diff], cloud: ConfigTree) -> None:
         elif action == "push":
             node["push"]()
         elif action == "update":
-            cloud_node = get_node(cloud, path)
-            if cloud_node:
-                cloud_node["remove"]()
+            remote_node = get_node(remote, path)
+            if remote_node:
+                remote_node["remove"]()
             node["push"]()
         else:
             msg = f"unknown action: {action}"
             raise ValueError(msg)
 
 
-def run_deltas(cloud: ConfigTree, local: ConfigTree) -> None:
+def run_deltas(remote: ConfigTree, local: ConfigTree) -> None:
     """Diff two config trees, prompt for confirmation, and apply changes."""
-    diffs: list[Diff] = list(diff_trees(cloud, local))
+    diffs: list[Diff] = list(diff_trees(remote, local))
 
     if not diffs:
         logger.info("no changes")
         return
 
-    log_diffs(diffs, cloud)
+    log_diffs(diffs, remote)
 
     confirm = input("\nproceed with writes? [y/N] ")
     if confirm.lower() != "y":
         logger.info("aborted")
         return
 
-    apply_diffs(diffs, cloud)
+    apply_diffs(diffs, remote)

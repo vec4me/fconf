@@ -36,7 +36,7 @@ def init(api_key: str | None = None) -> None:
 
 
 # Helpers
-def call_api(
+def perform(
     method: Literal["delete", "get", "patch", "post", "put"],
     url: str,
     json: dict[str, object] | None = None,
@@ -91,7 +91,7 @@ def paginate(endpoint: str) -> list[dict[str, object]]:
 
 # Fetchers
 def fetch_all() -> dict[str, object]:
-    """Fetch everything from cloud. Returns dict with phone_numbers, msg_profiles, voice_profiles, cred_connections."""
+    """Fetch everything from remote. Returns dict with phone_numbers, msg_profiles, voice_profiles, cred_connections."""
     logger.info("  fetching phone numbers...")
     phone_numbers = {entry["phone_number"]: entry for entry in paginate("phone_numbers")}
     logger.info("  fetching profiles and connections...")
@@ -122,8 +122,8 @@ def unassign_phone_numbers(phone_numbers: dict[str, dict[str, object]]) -> None:
     """Unassign messaging and voice profiles from all phone numbers."""
     logger.info("unassigning...")
     for phone_number, data in phone_numbers.items():
-        messaging_result = call_api("patch", f"phone_numbers/{data['id']}/messaging", {"messaging_profile_id": None})
-        voice_result = call_api("patch", f"phone_numbers/{data['id']}/voice", {"connection_id": None})
+        messaging_result = perform("patch", f"phone_numbers/{data['id']}/messaging", {"messaging_profile_id": None})
+        voice_result = perform("patch", f"phone_numbers/{data['id']}/voice", {"connection_id": None})
         logger.info(
             "  %s: messaging=%s, voice=%s",
             phone_number,
@@ -132,15 +132,15 @@ def unassign_phone_numbers(phone_numbers: dict[str, dict[str, object]]) -> None:
         )
 
 
-def delete_old_profiles(state: dict[str, object]) -> None:
+def delete_old_profiles(profile_data: dict[str, object]) -> None:
     """Delete existing credential connections, voice profiles, and messaging profiles."""
     logger.info("deleting...")
-    for profile in state["credential_connections"]:
-        call_api("delete", f"credential_connections/{profile['id']}")
-    for profile in state["voice_profiles"]:
-        call_api("delete", f"outbound_voice_profiles/{profile['id']}")
-    for profile in state["messaging_profiles"]:
-        call_api("delete", f"messaging_profiles/{profile['id']}")
+    for profile in profile_data["credential_connections"]:
+        perform("delete", f"credential_connections/{profile['id']}")
+    for profile in profile_data["voice_profiles"]:
+        perform("delete", f"outbound_voice_profiles/{profile['id']}")
+    for profile in profile_data["messaging_profiles"]:
+        perform("delete", f"messaging_profiles/{profile['id']}")
 
 
 def create_phone_config(
@@ -155,7 +155,7 @@ def create_phone_config(
 ) -> None:
     """Create messaging profile, voice profile, and credential connection for a phone number."""
     logger.info("  %s", phone_number)
-    messaging_profile = call_api("post", "messaging_profiles", {
+    messaging_profile = perform("post", "messaging_profiles", {
         "name": f"msg-{phone_number}",
         "webhook_url": webhook_url,
         "webhook_api_version": "2",
@@ -163,7 +163,7 @@ def create_phone_config(
     })
     logger.info("    messaging profile: ok")
 
-    voice_profile = call_api("post", "outbound_voice_profiles", {
+    voice_profile = perform("post", "outbound_voice_profiles", {
         "name": f"voice-{phone_number}",
         "traffic_type": "conversational",
         "service_plan": "global",
@@ -171,7 +171,7 @@ def create_phone_config(
     })
     logger.info("    outbound voice profile: ok")
 
-    connection = call_api("post", "credential_connections", {
+    connection = perform("post", "credential_connections", {
         "connection_name": f"sip-{phone_number}",
         "user_name": f"user{phone_number[-4:]}",
         "password": sip_password,
@@ -189,7 +189,7 @@ def create_phone_config(
     logger.info("    credential connection: ok")
 
     apply_voice_settings(phone_number, data, connection, external_pin=external_pin, number_config=number_config)
-    call_api(
+    perform(
         "patch",
         f"phone_numbers/{data['id']}/messaging",
         {"messaging_profile_id": messaging_profile["id"]},
@@ -215,7 +215,7 @@ def apply_voice_settings(
     if phone_number in number_config and "call_forwarding" in number_config[phone_number]:
         voice_settings["call_forwarding"] = number_config[phone_number]["call_forwarding"]
 
-    voice_result = call_api("patch", f"phone_numbers/{data['id']}/voice", voice_settings)
+    voice_result = perform("patch", f"phone_numbers/{data['id']}/voice", voice_settings)
     media_features = voice_result["media_features"]
     logger.info(
         "    voice: hd=%s, rtp_auto=%s, t38=%s",
@@ -223,7 +223,7 @@ def apply_voice_settings(
         media_features["rtp_auto_adjust_enabled"],
         media_features["t38_fax_gateway_enabled"],
     )
-    result = call_api("patch", f"phone_numbers/{data['id']}", {
+    result = perform("patch", f"phone_numbers/{data['id']}", {
         "number_level_routing": "disabled",
         "external_pin": external_pin,
         "hd_voice_enabled": False,
@@ -235,7 +235,7 @@ def cleanup_profiles() -> None:
     logger.info("cleanup...")
     for profile in paginate("messaging_profiles"):
         if str(profile["name"]).startswith("msg-") and profile["phone_numbers_count"] == 0:
-            call_api("delete", f"messaging_profiles/{profile['id']}")
+            perform("delete", f"messaging_profiles/{profile['id']}")
 
     def deduplicate(endpoint: str, prefix: str, name_key: str = "name") -> None:
         seen: set[str] = set()
@@ -243,7 +243,7 @@ def cleanup_profiles() -> None:
             name = str(profile[name_key])
             if name.startswith(prefix):
                 if name in seen:
-                    call_api("delete", f"{endpoint}/{profile['id']}")
+                    perform("delete", f"{endpoint}/{profile['id']}")
                 else:
                     seen.add(name)
 
@@ -255,7 +255,7 @@ def cleanup_profiles() -> None:
 
 # Configure
 def configure(
-    state: dict[str, object],
+    profile_data: dict[str, object],
     webhook_url: str,
     voice_destinations: list[str],
     sip_password: str,
@@ -264,7 +264,7 @@ def configure(
     number_config: dict[str, dict[str, object]],
 ) -> None:
     """Recreate all Telnyx profiles and connections for managed phone numbers."""
-    phone_numbers: dict[str, dict[str, object]] = state["phone_numbers"]
+    phone_numbers: dict[str, dict[str, object]] = profile_data["phone_numbers"]
     if not phone_numbers:
         return
 
@@ -274,7 +274,7 @@ def configure(
 
     logger.info("")
     unassign_phone_numbers(phone_numbers)
-    delete_old_profiles(state)
+    delete_old_profiles(profile_data)
 
     logger.info("creating...")
     for phone_number, data in phone_numbers.items():

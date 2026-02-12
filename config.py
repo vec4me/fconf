@@ -21,6 +21,16 @@ logger = logging.getLogger(__name__)
 # Cloudflare
 # ============================================================
 
+CF_DKIM_RECORD = (
+    "v=DKIM1; h=sha256; k=rsa;"
+    " p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAiweykoi+o48IOGuP7GR3X0MOExCUDY"
+    "/BCRHoWBnh3rChl7WhdyCxW3jgq1daEjPPqoi7sJvdg5hEQVsgVRQP4DcnQDVjGMbASQtrY4WmB1"
+    "VebF+RPJB2ECPsEDTpeiI5ZyUAwJaVX7r6bznU67g7LvFq35yIo4sdlmtZGV+i0H4cpYH9+3JJ78"
+    "km4KXwaf9xUJCWF6nxeD+qG6Fyruw1Qlbds2r85U9dkNDVAS3gioCvELryh1TxKGiVTkg4wqHTyH"
+    "fWsp7KD3WQHYJn0RyfJJu6YEmL77zonn7p2SRMvTMP3ZEXibnC9gz3nnhR6wcYL8Q7zXypKTMD58"
+    "bTixDSJwIDAQAB"
+)
+
 ZONE_CONFIG: dict[str, dict[str, object]] = {
     "hiroshimajobnavi.com": {
         "address": "34.111.141.225",
@@ -36,7 +46,7 @@ ZONE_CONFIG: dict[str, dict[str, object]] = {
     "clarkn.co.jp": {
         "google_verification": "ZsBDgLNcr70Rc7e6dF47J7pbLp435l1CF-hHyf6EaQM",
         "mail_server": "smtp.google.com",
-        "additional_records": [("uni", "219.211.176.140", False)],
+        "additional_records": [("uni", "A", "219.211.176.140", False)],
         "worker_domains": [("clarkn-meet", "meet")],
     },
     "southtowntattoocollective.com": {
@@ -48,6 +58,7 @@ ZONE_CONFIG: dict[str, dict[str, object]] = {
     },
     "je.gy": {
         "short_name": "jegy",
+        "icloud_mail": True,
     },
 }
 
@@ -66,8 +77,8 @@ def is_brr_child(zone: dict[str, object]) -> bool:
 
 def is_www_primary(zone: dict[str, object]) -> bool:
     """Check whether www is the primary hostname for a zone."""
-    name = str(zone["name"])
-    return not name.split(".")[0].isdigit() and name.split(".")[-1] in {"com", "net", "org", "jp"}
+    parts = str(zone["name"]).split(".")
+    return not parts[0].isdigit() and parts[-1] in {"com", "net", "org", "jp"}
 
 
 def get_hostnames(zone: dict[str, object]) -> tuple[str, str]:
@@ -123,22 +134,45 @@ def get_hosting_type(
 
 # Email
 
-def configure_ses_email(
+def configure_cf_email(
     local: ConfigTree,
     zone: dict[str, object],
-    aws_region: str,
+    forward_to: str,
     dkim_tokens: dict[str, list[str]] | None,
 ) -> None:
-    """Configure SES-based email DNS records for a zone."""
+    """Configure Cloudflare Email Routing and SES outbound DNS for a zone."""
     name = str(zone["name"])
-    cf.make_record(local, zone, "@", f"inbound-smtp.{aws_region}.amazonaws.com", "MX", priority=10)
-    cf.make_record(local, zone, "@", "v=spf1 include:amazonses.com ~all")
+    is_icloud = get_config(zone, "icloud_mail") is not None
+
+    spf_includes = "include:_spf.mx.cloudflare.net include:amazonses.com"
+    if is_icloud:
+        spf_includes += " include:icloud.com"
+    cf.make_record(local, zone, "@", "TXT", f"v=spf1 {spf_includes} ~all")
+
+    # Cloudflare Email Routing MX
+    cf.make_record(local, zone, "@", "MX", "route1.mx.cloudflare.net", priority=10)
+    cf.make_record(local, zone, "@", "MX", "route2.mx.cloudflare.net", priority=20)
+    cf.make_record(local, zone, "@", "MX", "route3.mx.cloudflare.net", priority=30)
+
+    # Cloudflare Email Routing DKIM
+    cf.make_record(local, zone, "cf2024-1._domainkey", "TXT", CF_DKIM_RECORD)
+
+    # SES outbound DKIM
     if dkim_tokens and name in dkim_tokens:
         for token in dkim_tokens[name]:
             cf.make_record(
-                local, zone, f"{token}._domainkey",
+                local, zone, f"{token}._domainkey", "CNAME",
                 f"{token}.dkim.amazonses.com", proxied=False,
             )
+
+    # iCloud DKIM
+    if is_icloud:
+        cf.make_record(
+            local, zone, "sig1._domainkey", "CNAME",
+            f"sig1.dkim.{name}.at.icloudmailadmin.com", proxied=False,
+        )
+
+    cf.make_email_routing_catch_all(local, zone, forward_to=forward_to)
 
 
 def configure_google_email(local: ConfigTree, zone: dict[str, object]) -> None:
@@ -146,29 +180,27 @@ def configure_google_email(local: ConfigTree, zone: dict[str, object]) -> None:
     mail_server = get_config(zone, "mail_server")
     google_verification = get_config(zone, "google_verification")
     if google_verification is not None:
-        cf.make_record(local, zone, "@", f"google-site-verification={google_verification}")
-    cf.make_record(local, zone, "@", str(mail_server), "MX", priority=1)
-    cf.make_record(local, zone, "@", "v=spf1 include:_spf.google.com ~all")
+        cf.make_record(local, zone, "@", "TXT", f"google-site-verification={google_verification}")
+    cf.make_record(local, zone, "@", "MX", str(mail_server), priority=1)
+    cf.make_record(local, zone, "@", "TXT", "v=spf1 include:_spf.google.com ~all")
 
 
 def configure_email(
     local: ConfigTree,
     zone: dict[str, object],
-    aws_region: str | None,
     dkim_tokens: dict[str, list[str]] | None = None,
+    forward_to: str | None = None,
 ) -> None:
     """Configure email DNS records for a zone based on its email provider."""
-    name = str(zone["name"])
-
     mail_server = get_config(zone, "mail_server")
     if mail_server is not None:
         configure_google_email(local, zone)
         return
 
-    if aws_region is None:
-        msg = f"AWS_REGION must be set for SES domain {name}"
+    if forward_to is None:
+        msg = f"forward_to must be set for email routing domain {zone['name']}"
         raise ValueError(msg)
-    configure_ses_email(local, zone, aws_region, dkim_tokens)
+    configure_cf_email(local, zone, forward_to, dkim_tokens)
 
 
 # DNS
@@ -176,12 +208,11 @@ def configure_email(
 def configure_dns(
     local: ConfigTree,
     workers: dict[str, object],
-    pages: dict[str, object],
     zone: dict[str, object],
     vps: str | None,
+    hosting_type: str | None,
 ) -> None:
     """Configure DNS records for a zone including A/CNAME, DMARC, mail, and API records."""
-    hosting_type = get_hosting_type(workers, pages, zone)
     address = get_config(zone, "address")
     if not address:
         address = "35.192.114.80" if "rate" in str(zone["name"]) else vps
@@ -190,22 +221,22 @@ def configure_dns(
 
     if hosting_type == "page":
         pages_target = f"{get_short_name(zone)}.pages.dev"
-        cf.make_record(local, zone, primary_label, pages_target)
-        cf.make_record(local, zone, secondary_label, pages_target)
+        cf.make_record(local, zone, primary_label, "CNAME", pages_target)
+        cf.make_record(local, zone, secondary_label, "CNAME", pages_target)
     elif hosting_type == "worker":
         pass  # worker domains handle DNS records
     else:
-        cf.make_record(local, zone, primary_label, str(address))
-        cf.make_record(local, zone, secondary_label, str(address))
+        cf.make_record(local, zone, primary_label, "A", str(address))
+        cf.make_record(local, zone, secondary_label, "A", str(address))
 
-    cf.make_record(local, zone, "_dmarc", "v=DMARC1; p=quarantine;")
+    cf.make_record(local, zone, "_dmarc", "TXT", "v=DMARC1; p=quarantine;")
 
-    cf.make_record(local, zone, "mail", "mail.vec4me.workers.dev")
+    cf.make_record(local, zone, "mail", "CNAME", "mail.vec4me.workers.dev")
     cf.make_route(local, zone, f"mail.{zone['name']}/unsubscribe*", "mail")
 
     api_worker = find_api_worker(workers, zone)
     if api_worker:
-        cf.make_record(local, zone, "api", f"{api_worker}.vec4me.workers.dev")
+        cf.make_record(local, zone, "api", "CNAME", f"{api_worker}.vec4me.workers.dev")
         cf.make_route(local, zone, f"api.{zone['name']}/*", api_worker)
 
     configure_sip_records(local, zone)
@@ -216,7 +247,7 @@ def configure_sip_records(local: ConfigTree, zone: dict[str, object]) -> None:
     """Configure SIP DNS records for a zone if applicable."""
     sip_server = get_config(zone, "sip_server")
     if sip_server:
-        cf.make_record(local, zone, "sip", str(sip_server), proxied=False)
+        cf.make_record(local, zone, "sip", "CNAME", str(sip_server), proxied=False)
         cf.make_srv_record(local, zone, "_sip", "_udp", f"sip.{zone['name']}", port=5060)
 
 
@@ -224,8 +255,8 @@ def configure_additional_records(local: ConfigTree, zone: dict[str, object]) -> 
     """Configure any additional DNS records specified in zone config."""
     additional_records = get_config(zone, "additional_records")
     if additional_records:
-        for name, content, proxied in additional_records:
-            cf.make_record(local, zone, name, content, proxied=proxied)
+        for name, record_type, content, proxied in additional_records:
+            cf.make_record(local, zone, name, record_type, content, proxied=proxied)
 
 
 # Redirects
@@ -294,9 +325,9 @@ def configure_domains(
     pages: dict[str, object],
     zone: dict[str, object],
     used_services: set[str],
+    hosting_type: str | None,
 ) -> None:
     """Configure worker and page custom domains for a zone."""
-    hosting_type = get_hosting_type(workers, pages, zone)
     primary, secondary = get_hostnames(zone)
 
     worker_domains = get_config(zone, "worker_domains")
@@ -374,139 +405,119 @@ def configure_regery(
 
 def configure_ses(
     local: ConfigTree,
-    domains: dict[str, str],
-    bucket_name: str,
+    domains: list[str],
 ) -> None:
-    """Configure SES infrastructure and receipt rules for email forwarding."""
-    ses.make_lambda_fn(local, bucket_name, domains)
-
-    rule_set_name = "main"
-    ses.make_rule_set(local, rule_set_name, active=True)
-
-    lambda_arn = ses.get_lambda_arn()
+    """Configure SES outbound infrastructure (identities + SMTP users)."""
     for domain in domains:
         ses.make_identity(local, domain)
-        ses.make_receipt_rule(
-            local,
-            rule_set_name,
-            rule_name=f"{domain}-catch-all",
-            recipients=[domain],
-            actions=[
-                {"S3Action": {"BucketName": bucket_name, "ObjectKeyPrefix": ""}},
-                {"LambdaAction": {"FunctionArn": lambda_arn, "InvocationType": "Event"}},
-            ],
-        )
+        ses.make_smtp_user(local, domain)
 
 
 # ============================================================
 # Main
 # ============================================================
 
-def build_settings() -> dict[str, object]:
-    """Build the zone settings settings dict."""
-    return {
-        "0rtt": "on",
-        "always_online": "off",
-        "always_use_https": "off",
-        "automatic_https_rewrites": "off",
-        "brotli": "on",
-        "browser_check": "off",
-        "development_mode": "off",
-        "early_hints": "off",
-        "email_obfuscation": "off",
-        "filter_logs_to_cloudflare": "off",
-        "hotlink_protection": "off",
-        "http3": "on",
-        "ip_geolocation": "on",
-        "ipv6": "on",
-        "log_to_cloudflare": "on",
-        "opportunistic_encryption": "off",
-        "opportunistic_onion": "off",
-        "pq_keyex": "off",
-        "privacy_pass": "off",
-        "pseudo_ipv4": "off",
-        "replace_insecure_js": "off",
-        "rocket_loader": "off",
-        "server_side_exclude": "off",
-        "ssl": "flexible",
-        "tls_1_2_only": "off",
-        "tls_1_3": "zrt",
-        "tls_client_auth": "off",
-        "visitor_ip": "on",
-        "waf": "off",
-        "websockets": "on",
-        "ech": "off",
-        "orange_to_orange": "off",
-        "response_buffering": "off",
-        "mirage": "off",
-        "webp": "off",
-        "polish": "off",
-        "prefetch_preload": "off",
-        "http2": "on",
-        "true_client_ip_header": "off",
-        "origin_error_page_pass_thru": "off",
-        "sort_query_string_for_cache": "off",
-        "proxy_read_timeout": 100,
-        "long_lived_grpc": "off",
-        "advanced_ddos": "off",
-        "cache_level": "aggressive",
-        "cname_flattening": "flatten_at_root",
-        "min_tls_version": "1.0",
-        "security_level": "essentially_off",
-        "browser_cache_ttl": 0,
-        "challenge_ttl": 604800,
-        "edge_cache_ttl": 7200,
-        "max_upload": 100,
-        "minify": {"css": "off", "html": "off", "js": "off"},
-        "mobile_redirect": {"status": "off", "mobile_subdomain": None, "strip_uri": False},
-        "security_header": {
-            "strict_transport_security": {
-                "enabled": False,
-                "max_age": 0,
-                "include_subdomains": False,
-                "preload": False,
-                "nosniff": False,
-            },
+DEFAULT_SETTINGS: dict[str, object] = {
+    "0rtt": "on",
+    "always_online": "off",
+    "always_use_https": "off",
+    "automatic_https_rewrites": "off",
+    "brotli": "on",
+    "browser_check": "off",
+    "development_mode": "off",
+    "early_hints": "off",
+    "email_obfuscation": "off",
+    "filter_logs_to_cloudflare": "off",
+    "hotlink_protection": "off",
+    "http3": "on",
+    "ip_geolocation": "on",
+    "ipv6": "on",
+    "log_to_cloudflare": "on",
+    "opportunistic_encryption": "off",
+    "opportunistic_onion": "off",
+    "pq_keyex": "off",
+    "privacy_pass": "off",
+    "pseudo_ipv4": "off",
+    "replace_insecure_js": "off",
+    "rocket_loader": "off",
+    "server_side_exclude": "off",
+    "ssl": "flexible",
+    "tls_1_2_only": "off",
+    "tls_1_3": "zrt",
+    "tls_client_auth": "off",
+    "visitor_ip": "on",
+    "waf": "off",
+    "websockets": "on",
+    "ech": "off",
+    "orange_to_orange": "off",
+    "response_buffering": "off",
+    "mirage": "off",
+    "webp": "off",
+    "polish": "off",
+    "prefetch_preload": "off",
+    "http2": "on",
+    "true_client_ip_header": "off",
+    "origin_error_page_pass_thru": "off",
+    "sort_query_string_for_cache": "off",
+    "proxy_read_timeout": 100,
+    "long_lived_grpc": "off",
+    "advanced_ddos": "off",
+    "cache_level": "aggressive",
+    "cname_flattening": "flatten_at_root",
+    "min_tls_version": "1.0",
+    "security_level": "essentially_off",
+    "browser_cache_ttl": 0,
+    "challenge_ttl": 604800,
+    "edge_cache_ttl": 7200,
+    "max_upload": 100,
+    "minify": {"css": "off", "html": "off", "js": "off"},
+    "mobile_redirect": {"status": "off", "mobile_subdomain": None, "strip_uri": False},
+    "security_header": {
+        "strict_transport_security": {
+            "enabled": False,
+            "max_age": 0,
+            "include_subdomains": False,
+            "preload": False,
+            "nosniff": False,
         },
-        "ciphers": [],
-        "origin_max_http_version": "1",
-    }
+    },
+    "ciphers": [],
+    "origin_max_http_version": "1",
+}
 
 
 def run_ses_fetch(
-    ses_domains: dict[str, str],
-    ses_bucket: str,
     aws_region: str | None,
 ) -> tuple[ConfigTree, dict[str, list[str]]]:
-    """Initialize SES and fetch cloud state. Returns (cloud_tree, dkim_tokens)."""
-    if not ses_domains:
-        return {}, {}
+    """Initialize SES and fetch remote state. Returns (remote_tree, dkim_tokens)."""
     if aws_region is None:
-        msg = "AWS_REGION must be set when ses_domains is configured"
-        raise ValueError(msg)
+        return {}, {}
     ses.init(aws_region)
     logger.info("=== SES ===")
-    return ses.fetch_all(ses_bucket)
+    return ses.fetch_all()
 
 
 def run_cloudflare(
     settings: dict[str, object],
-    aws_region: str | None,
     vps: str | None,
     dkim_tokens: dict[str, list[str]],
+    email_routing_domains: dict[str, str],
+    zone_list: list[dict[str, object]] | None = None,
 ) -> dict[str, dict[str, object]]:
     """Run the Cloudflare declarative configuration. Returns zones dict."""
     logger.info("\n=== Cloudflare ===")
     used_services: set[str] = set()
 
-    cloud, zones, workers, pages = cf.fetch_all(setting_ids=set(settings.keys()))
+    remote, zones, workers, pages = cf.fetch_all(setting_ids=set(settings.keys()), zone_list=zone_list)
 
     local: ConfigTree = {}
     for zone in zones.values():
-        configure_email(local, zone, aws_region, dkim_tokens)
-        configure_dns(local, workers, pages, zone, vps)
+        hosting_type = get_hosting_type(workers, pages, zone)
+        forward_to = email_routing_domains.get(str(zone["name"]))
+        configure_email(local, zone, dkim_tokens, forward_to)
+        configure_dns(local, workers, zone, vps, hosting_type)
         configure_redirects(local, zone)
-        configure_domains(local, workers, pages, zone, used_services)
+        configure_domains(local, workers, pages, zone, used_services, hosting_type)
         configure_settings(local, zone, settings)
 
     for worker_id in workers:
@@ -516,23 +527,22 @@ def run_cloudflare(
         if page_name not in used_services:
             logger.info("unused page: %s", page_name)
 
-    provider.run_deltas(cloud, local)
+    provider.run_deltas(remote, local)
 
     return zones
 
 
 def run_ses_apply(
-    ses_cloud: ConfigTree,
-    ses_domains: dict[str, str],
-    ses_bucket: str,
+    ses_remote: ConfigTree,
+    ses_domains: list[str],
 ) -> None:
     """Run the SES declarative configuration."""
     if not ses_domains:
         return
     logger.info("\n=== SES ===")
     local: ConfigTree = {}
-    configure_ses(local, ses_domains, ses_bucket)
-    provider.run_deltas(ses_cloud, local)
+    configure_ses(local, ses_domains)
+    provider.run_deltas(ses_remote, local)
 
 
 def main() -> None:
@@ -542,14 +552,11 @@ def main() -> None:
     vps = os.getenv("VPS")
     aws_region = os.getenv("AWS_REGION")
 
-    settings = build_settings()
-
-    ses_forwards: dict[str, str] = {
+    email_forwards: dict[str, str] = {
         "tattoocollectivereno.com": "tattoocollectivereno@gmail.com",
         "southtowntattoocollective.com": "tattoocollectivereno@gmail.com",
     }
-    ses_default_forward = "vec4me@icloud.com"
-    ses_bucket = "vec4me-ses-forwarder"
+    email_default_forward = "vec4me@icloud.com"
 
     cf.init()
     telnyx.init()
@@ -557,22 +564,25 @@ def main() -> None:
 
     google_domains = {name for name, config in ZONE_CONFIG.items() if "mail_server" in config}
     zone_list = cf.paginate("zones")
-    ses_domains: dict[str, str] = {}
+    email_routing_domains: dict[str, str] = {}
     for zone in zone_list:
         name = str(zone["name"])
         if name not in google_domains:
-            ses_domains[name] = ses_forwards.get(name, ses_default_forward)
+            email_routing_domains[name] = email_forwards.get(name, email_default_forward)
 
-    ses_cloud, dkim_tokens = run_ses_fetch(ses_domains, ses_bucket, aws_region)
-    zones = run_cloudflare(settings, aws_region, vps, dkim_tokens)
-    run_ses_apply(ses_cloud, ses_domains, ses_bucket)
+    ses_remote, dkim_tokens = run_ses_fetch(aws_region)
+    ses_domains = list(email_routing_domains.keys())
+
+    cf.ensure_destination_addresses(set(email_routing_domains.values()))
+    zones = run_cloudflare(DEFAULT_SETTINGS, vps, dkim_tokens, email_routing_domains, zone_list=zone_list)
+    run_ses_apply(ses_remote, ses_domains)
 
     sip_password = os.getenv("SIP_PASSWORD", "")
 
     logger.info("\n=== Telnyx ===")
-    state = telnyx.fetch_all()
+    telnyx_data = telnyx.fetch_all()
     telnyx.configure(
-        state,
+        telnyx_data,
         webhook_url="https://sms-cloudflare-central.vec4me.workers.dev/",
         voice_destinations=["US", "CA", "MX", "JP"],
         sip_password=sip_password,
@@ -591,11 +601,11 @@ def main() -> None:
     regery_contact_id = os.getenv("REGERY_CONTACT_ID", "")
 
     logger.info("\n=== Regery ===")
-    regery_cloud = regery.fetch_all()
+    regery_remote = regery.fetch_all()
 
     local: ConfigTree = {}
     configure_regery(local, zones, regery_contact_id)
-    provider.run_deltas(regery_cloud, local)
+    provider.run_deltas(regery_remote, local)
 
 
 if __name__ == "__main__":

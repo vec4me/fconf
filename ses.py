@@ -1,19 +1,16 @@
-"""AWS SES email forwarding infrastructure and declarative resource builders."""
+"""AWS SES outbound email infrastructure and declarative resource builders."""
 
 from __future__ import annotations
 
-import hashlib
-import io
 import json
 import logging
-import zipfile
+from pathlib import Path as FilePath
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from mypy_boto3_iam.client import IAMClient
-    from mypy_boto3_lambda.client import LambdaClient
-    from mypy_boto3_s3.client import S3Client
-    from mypy_boto3_ses.client import SESClient
     from mypy_boto3_sesv2.client import SESV2Client
 
     from provider import ConfigTree, Path
@@ -26,13 +23,9 @@ class State:
 
     def __init__(self) -> None:
         """Initialize empty clients."""
-        self.ses: SESClient | None = None
         self.sesv2: SESV2Client | None = None
-        self.s3: S3Client | None = None
         self.iam: IAMClient | None = None
-        self.lambda_client: LambdaClient | None = None
         self.region: str = ""
-        self.account_id: str = ""
 
 
 state = State()
@@ -42,236 +35,47 @@ def init(region: str) -> None:
     """Initialize AWS service clients for the given region."""
     import boto3
     state.region = region
-    state.ses = boto3.client("ses", region_name=region)
     state.sesv2 = boto3.client("sesv2", region_name=region)
-    state.s3 = boto3.client("s3", region_name=region)
     state.iam = boto3.client("iam")
-    state.lambda_client = boto3.client("lambda", region_name=region)
-    state.account_id = boto3.client("sts").get_caller_identity()["Account"]
 
 
-def get_lambda_arn() -> str:
-    """Compute the Lambda function ARN from account ID and region."""
-    return f"arn:aws:lambda:{state.region}:{state.account_id}:function:ses-forwarder"
+CREDENTIALS_FILE = FilePath(__file__).parent / "smtp_credentials.json"
 
 
-# Lambda code
-FORWARDER_CODE = """\
-import boto3
-import json
-import os
-
-def handler(event, context):
-    s3 = boto3.client("s3")
-    ses = boto3.client("ses", region_name=os.environ["REGION"])
-    record = event["Records"][0]["ses"]
-    message_id = record["mail"]["messageId"]
-    bucket = os.environ["BUCKET"]
-    forward_map = json.loads(os.environ["FORWARD_MAP"])
-
-    obj = s3.get_object(Bucket=bucket, Key=message_id)
-    raw = obj["Body"].read()
-
-    for recipient in record["receipt"]["recipients"]:
-        domain = recipient.split("@")[1]
-        forward_to = forward_map.get(recipient) or forward_map.get(domain)
-        if not forward_to:
-            continue
-        ses.send_raw_email(
-            Source=f"noreply@{domain}",
-            Destinations=[forward_to],
-            RawMessage={"Data": raw},
-        )
-
-    s3.delete_object(Bucket=bucket, Key=message_id)
-"""
-
-CODE_HASH = hashlib.sha256(FORWARDER_CODE.encode()).hexdigest()[:16]
+def load_credentials() -> dict[str, dict[str, object]]:
+    """Load stored SMTP credentials from disk."""
+    if CREDENTIALS_FILE.exists():
+        return json.loads(CREDENTIALS_FILE.read_text())
+    return {}
 
 
-def zip_code() -> bytes:
-    """Create a ZIP archive containing the forwarder Lambda code."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("index.py", FORWARDER_CODE)
-    return buf.getvalue()
+def write_credentials(credentials: dict[str, dict[str, object]]) -> None:
+    """Write all SMTP credentials to disk."""
+    CREDENTIALS_FILE.write_text(json.dumps(credentials, indent=2) + "\n")
 
 
-# Infrastructure resource maker
-
-def ensure_s3_bucket(bucket_name: str) -> None:
-    """Ensure the S3 bucket exists with the correct policy."""
-    from botocore.exceptions import ClientError
-    s3 = state.s3
-    if s3 is None:
-        msg = "SES not initialized"
-        raise RuntimeError(msg)
-    try:
-        s3.head_bucket(Bucket=bucket_name)
-    except ClientError:
-        logger.info("    bucket %s: creating...", bucket_name)
-        if state.region == "us-east-1":
-            s3.create_bucket(Bucket=bucket_name)
-        else:
-            s3.create_bucket(
-                Bucket=bucket_name,
-                CreateBucketConfiguration={"LocationConstraint": state.region},
-            )
-    s3.put_bucket_policy(
-        Bucket=bucket_name,
-        Policy=json.dumps({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": {"Service": "ses.amazonaws.com"},
-                "Action": "s3:PutObject",
-                "Resource": f"arn:aws:s3:::{bucket_name}/*",
-            }],
-        }),
-    )
+def save_credential(domain: str, credential: dict[str, object]) -> None:
+    """Save an SMTP credential for a domain to disk."""
+    credentials = load_credentials()
+    credentials[domain] = credential
+    write_credentials(credentials)
 
 
-def ensure_iam_role(bucket_name: str) -> str:
-    """Ensure the IAM role exists with the correct policy. Returns role ARN."""
-    from botocore.exceptions import ClientError
-    iam = state.iam
-    if iam is None:
-        msg = "SES not initialized"
-        raise RuntimeError(msg)
-    role_name = "ses-forwarder-lambda"
-    try:
-        role = iam.get_role(RoleName=role_name)
-    except ClientError:
-        logger.info("    role %s: creating...", role_name)
-        role = iam.create_role(
-            RoleName=role_name,
-            AssumeRolePolicyDocument=json.dumps({
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Effect": "Allow",
-                    "Principal": {"Service": "lambda.amazonaws.com"},
-                    "Action": "sts:AssumeRole",
-                }],
-            }),
-        )
-    iam.put_role_policy(
-        RoleName=role_name,
-        PolicyName="ses-forwarder",
-        PolicyDocument=json.dumps({
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Action": ["ses:SendRawEmail"],
-                    "Resource": "*",
-                },
-                {
-                    "Effect": "Allow",
-                    "Action": ["s3:GetObject", "s3:DeleteObject"],
-                    "Resource": f"arn:aws:s3:::{bucket_name}/*",
-                },
-                {
-                    "Effect": "Allow",
-                    "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-                    "Resource": "arn:aws:logs:*:*:*",
-                },
-            ],
-        }),
-    )
-    return role["Role"]["Arn"]
+def remove_credential(domain: str) -> None:
+    """Remove a stored SMTP credential for a domain."""
+    credentials = load_credentials()
+    if domain in credentials:
+        del credentials[domain]
+        write_credentials(credentials)
 
 
-def make_lambda_fn(
-    tree: ConfigTree,
-    bucket_name: str,
-    forward_map: dict[str, str],
-    *,
-    cloudee: dict[str, object] | None = None,
-) -> None:
-    """Build a Lambda function node in the config tree."""
-    from provider import set_tree
-    func_name = "ses-forwarder"
-    env_vars = {
-        "BUCKET": bucket_name,
-        "CODE_HASH": CODE_HASH,
-        "FORWARD_MAP": json.dumps(forward_map, sort_keys=True),
-        "REGION": state.region,
-    }
-
-    if cloudee:
-        value: dict[str, object] = cloudee
-    else:
-        value = {"function_name": func_name, "env_vars": env_vars}
-
-    def push() -> None:
-        import time
-
-        from botocore.exceptions import ClientError
-        lam = state.lambda_client
-        if lam is None:
-            msg = "SES not initialized"
-            raise RuntimeError(msg)
-
-        ensure_s3_bucket(bucket_name)
-        role_arn = ensure_iam_role(bucket_name)
-        code_zip = zip_code()
-
-        try:
-            lam.get_function(FunctionName=func_name)
-            logger.info("    lambda %s: updating...", func_name)
-            lam.update_function_configuration(
-                FunctionName=func_name,
-                Environment={"Variables": env_vars},
-            )
-            lam.get_waiter("function_updated").wait(FunctionName=func_name)
-            lam.update_function_code(
-                FunctionName=func_name,
-                ZipFile=code_zip,
-            )
-        except lam.exceptions.ResourceNotFoundException:
-            logger.info("    lambda %s: creating...", func_name)
-            for attempt in range(5):
-                try:
-                    lam.create_function(
-                        FunctionName=func_name,
-                        Runtime="python3.12",
-                        Role=role_arn,
-                        Handler="index.handler",
-                        Code={"ZipFile": code_zip},
-                        Environment={"Variables": env_vars},
-                        Timeout=30,
-                    )
-                    break
-                except ClientError as e:
-                    max_retries = 4
-                    if "cannot be assumed" in str(e) and attempt < max_retries:
-                        time.sleep(2)
-                    else:
-                        raise
-
-        try:
-            lam.add_permission(
-                FunctionName=func_name,
-                StatementId="ses-invoke",
-                Action="lambda:InvokeFunction",
-                Principal="ses.amazonaws.com",
-            )
-        except ClientError as e:
-            if "ResourceConflictException" in str(type(e)):
-                pass
-            else:
-                raise
-
-    def remove() -> None:
-        lam = state.lambda_client
-        if lam is None:
-            msg = "SES not initialized"
-            raise RuntimeError(msg)
-        logger.info("    deleting lambda %s...", func_name)
-        lam.delete_function(FunctionName=func_name)
-
-    path: Path = ("infra", "lambda")
-    set_tree(tree, path, value, push, remove)
+def log_credentials() -> None:
+    """Log all stored SMTP credentials."""
+    credentials = load_credentials()
+    if not credentials:
+        return
+    for domain, cred in sorted(credentials.items()):
+        logger.info("  %s: host=%s port=%s user=%s", domain, cred["host"], cred["port"], cred["username"])
 
 
 # Resource makers
@@ -315,149 +119,168 @@ def make_identity(
     set_tree(tree, path, value, push, remove)
 
 
-def make_rule_set(
+# SMTP credentials
+
+SMTP_SIGNING_VERSION = b"\x04"
+
+
+def derive_smtp_password(secret_access_key: str, region: str) -> str:
+    """Derive an SES SMTP password from an IAM secret access key using AWS's documented algorithm."""
+    import base64
+    import hashlib
+    import hmac
+
+    def sign(key: bytes, message: str) -> bytes:
+        return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+
+    signature = sign(("AWS4" + secret_access_key).encode("utf-8"), "11111111")
+    signature = sign(signature, region)
+    signature = sign(signature, "ses")
+    signature = sign(signature, "aws4_request")
+    signature = sign(signature, "SendRawEmail")
+    return base64.b64encode(SMTP_SIGNING_VERSION + signature).decode("utf-8")
+
+
+def make_smtp_user(
     tree: ConfigTree,
-    name: str,
+    domain: str,
     *,
-    active: bool = True,
-    cloudee: dict[str, object] | None = None,
+    remote_data: dict[str, object] | None = None,
 ) -> None:
-    """Build an SES receipt rule set node in the config tree."""
+    """Build an IAM SMTP user node in the config tree."""
     from provider import set_tree
-    ses_client = state.ses
-    if ses_client is None:
+
+    iam = state.iam
+    if iam is None:
         msg = "SES not initialized"
         raise RuntimeError(msg)
 
-    value: dict[str, object] = (
-        {"name": name, "active": cloudee["active"]}
-        if cloudee
-        else {"name": name, "active": active}
-    )
+    username = f"ses-smtp-{domain.replace('.', '-')}"
+    smtp_host = f"email-smtp.{state.region}.amazonaws.com"
+    smtp_port = 587
 
-    def push() -> None:
-        if ses_client is None:
-            return
-        logger.info("    creating rule set %s...", name)
-        ses_client.create_receipt_rule_set(RuleSetName=name)
-        if active:
-            ses_client.set_active_receipt_rule_set(RuleSetName=name)
-
-    def remove() -> None:
-        if ses_client is None:
-            return
-        logger.info("    deleting rule set %s...", name)
-        active_set = ses_client.describe_active_receipt_rule_set()
-        if active_set["Metadata"]["Name"] == name:
-            ses_client.set_active_receipt_rule_set()  # deactivate
-        ses_client.delete_receipt_rule_set(RuleSetName=name)
-
-    path: Path = ("rule_sets", name)
-    set_tree(tree, path, value, push, remove)
-
-
-def make_receipt_rule(
-    tree: ConfigTree,
-    rule_set_name: str,
-    rule_name: str | None = None,
-    recipients: list[str] | None = None,
-    actions: list[dict[str, object]] | None = None,
-    *,
-    scan: bool = True,
-    tls: str = "Optional",
-    cloudee: dict[str, object] | None = None,
-) -> None:
-    """Build an SES receipt rule node in the config tree."""
-    from provider import set_tree
-    ses_client = state.ses
-    if ses_client is None:
-        msg = "SES not initialized"
-        raise RuntimeError(msg)
-
-    if cloudee:
-        rule_name = str(cloudee["Name"])
-        value: dict[str, object] = {
-            "name": cloudee["Name"],
-            "enabled": cloudee["Enabled"],
-            "recipients": sorted(cloudee["Recipients"]),            "actions": cloudee["Actions"],
-            "scan": cloudee["ScanEnabled"],
-            "tls": cloudee["TlsPolicy"],
-        }
+    if remote_data:
+        value: dict[str, object] = remote_data
     else:
-        if rule_name is None:
-            msg = "rule_name is required"
-            raise ValueError(msg)
-        if recipients is None:
-            msg = "recipients is required"
-            raise ValueError(msg)
-        if actions is None:
-            msg = "actions is required"
-            raise ValueError(msg)
-        value = {
-            "name": rule_name,
-            "enabled": True,
-            "recipients": sorted(recipients),
-            "actions": actions,
-            "scan": scan,
-            "tls": tls,
-        }
+        value = {"username": username, "host": smtp_host, "port": smtp_port}
 
     def push() -> None:
-        if ses_client is None:
-            return
-        logger.info("    creating receipt rule %s...", rule_name)
-        ses_client.create_receipt_rule(
-            RuleSetName=rule_set_name,
-            Rule={
-                "Name": value["name"],
-                "Enabled": value["enabled"],
-                "Recipients": value["recipients"],
-                "Actions": value["actions"],
-                "ScanEnabled": value["scan"],
-                "TlsPolicy": value["tls"],
-            },
+        from botocore.exceptions import ClientError
+
+        # Create IAM user
+        try:
+            iam.get_user(UserName=username)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchEntity":
+                logger.info("    creating IAM user %s...", username)
+                iam.create_user(UserName=username)
+            else:
+                raise
+
+        # Attach SES send policy
+        iam.put_user_policy(
+            UserName=username,
+            PolicyName="ses-send",
+            PolicyDocument=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": ["ses:SendRawEmail"],
+                    "Resource": "*",
+                }],
+            }),
         )
+
+        # Delete existing access keys before creating new one
+        existing_keys = iam.list_access_keys(UserName=username)
+        for key in existing_keys["AccessKeyMetadata"]:
+            iam.delete_access_key(UserName=username, AccessKeyId=key["AccessKeyId"])
+
+        # Create access key and derive SMTP password
+        access_key = iam.create_access_key(UserName=username)["AccessKey"]
+        smtp_password = derive_smtp_password(access_key["SecretAccessKey"], state.region)
+
+        save_credential(domain, {
+            "host": smtp_host,
+            "port": smtp_port,
+            "username": access_key["AccessKeyId"],
+            "password": smtp_password,
+        })
+        logger.info("    SMTP credentials saved for %s", domain)
 
     def remove() -> None:
-        if ses_client is None:
-            return
-        logger.info("    deleting receipt rule %s...", rule_name)
-        ses_client.delete_receipt_rule(
-            RuleSetName=rule_set_name,
-            RuleName=rule_name,
-        )
+        from botocore.exceptions import ClientError
 
-    path: Path = ("rules", rule_set_name, str(rule_name))
+        logger.info("    deleting SMTP user %s...", username)
+
+        def ignore_not_found(fn: Callable[[], None]) -> None:
+            try:
+                fn()
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "NoSuchEntity":
+                    return
+                raise
+
+        # Delete access keys
+        try:
+            existing_keys = iam.list_access_keys(UserName=username)
+            for key in existing_keys["AccessKeyMetadata"]:
+                iam.delete_access_key(UserName=username, AccessKeyId=key["AccessKeyId"])
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "NoSuchEntity":
+                raise
+
+        # Delete policy and user
+        ignore_not_found(lambda: iam.delete_user_policy(UserName=username, PolicyName="ses-send"))
+        ignore_not_found(lambda: iam.delete_user(UserName=username))
+
+        remove_credential(domain)
+
+    path: Path = ("smtp_users", domain)
     set_tree(tree, path, value, push, remove)
 
 
-# Fetch cloud state
+# Fetch remote state
 
-def fetch_infra(cloud: ConfigTree, bucket_name: str) -> None:
-    """Fetch Lambda state into cloud tree."""
-    lam = state.lambda_client
-    if lam is None:
+def fetch_smtp_users(remote: ConfigTree, known_domains: set[str]) -> int:
+    """Fetch existing IAM SMTP users into the remote tree. Returns count."""
+    from botocore.exceptions import ClientError
+    iam = state.iam
+    if iam is None:
         msg = "SES not initialized"
         raise RuntimeError(msg)
 
-    try:
-        func = lam.get_function(FunctionName="ses-forwarder")
-        env = func["Configuration"]["Environment"]["Variables"]
-        make_lambda_fn(
-            cloud, bucket_name, {},
-            cloudee={"function_name": "ses-forwarder", "env_vars": env},
-        )
-    except lam.exceptions.ResourceNotFoundException:
-        pass
+    credentials = load_credentials()
+    count = 0
+    for domain in known_domains:
+        username = f"ses-smtp-{domain.replace('.', '-')}"
+        try:
+            iam.get_user(UserName=username)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "NoSuchEntity":
+                continue
+            raise
+        cred = credentials.get(domain, {})
+        make_smtp_user(remote, domain, remote_data={
+            "username": username,
+            "host": cred.get("host"),
+            "port": cred.get("port"),
+        })
+        count += 1
+    return count
 
 
 def fetch_identities(
-    cloud: ConfigTree,
-    sesv2: SESV2Client,
+    remote: ConfigTree,
     dkim_tokens: dict[str, list[str]],
-) -> int:
-    """Fetch all SES domain identities into the cloud tree. Returns count."""
-    identity_count = 0
+) -> set[str]:
+    """Fetch all SES domain identities into the remote tree. Returns domain names."""
+    sesv2 = state.sesv2
+    if sesv2 is None:
+        msg = "SES not initialized"
+        raise RuntimeError(msg)
+
+    domains: set[str] = set()
     next_token: str | None = None
     while True:
         kwargs: dict[str, str] = {}
@@ -467,60 +290,32 @@ def fetch_identities(
         for identity in response["EmailIdentities"]:
             name = identity["IdentityName"]
             if identity["IdentityType"] == "DOMAIN":
-                make_identity(cloud, name)
+                make_identity(remote, name)
                 details = sesv2.get_email_identity(EmailIdentity=name)
                 tokens = details.get("DkimAttributes", {}).get("Tokens", [])
                 if tokens:
                     dkim_tokens[name] = list(tokens)
-                identity_count += 1
+                domains.add(name)
         if "NextToken" not in response:
             break
         next_token = response["NextToken"]
-    return identity_count
+    return domains
 
 
-def fetch_rule_sets(cloud: ConfigTree, ses_client: SESClient) -> int:
-    """Fetch all SES receipt rule sets into the cloud tree. Returns count."""
-    rule_set_count = 0
-    active_set = ses_client.describe_active_receipt_rule_set()
-    active_name: str | None = (
-        active_set["Metadata"]["Name"]
-        if "Metadata" in active_set
-        else None
-    )
-
-    for rs in ses_client.list_receipt_rule_sets()["RuleSets"]:
-        name = rs["Name"]
-        rule_set = ses_client.describe_receipt_rule_set(RuleSetName=name)
-        make_rule_set(cloud, name, cloudee={"name": name, "active": name == active_name})
-        rule_set_count += 1
-
-        for rule in rule_set["Rules"]:
-            make_receipt_rule(cloud, name, cloudee=dict(rule))
-
-    return rule_set_count
-
-
-def fetch_all(bucket_name: str) -> tuple[ConfigTree, dict[str, list[str]]]:
-    """Fetch everything from cloud. Returns (cloud tree, dkim_tokens)."""
-    ses_client = state.ses
-    sesv2 = state.sesv2
-    if ses_client is None or sesv2 is None:
-        msg = "SES not initialized"
-        raise RuntimeError(msg)
-
-    cloud: ConfigTree = {}
-
-    logger.info("  fetching infrastructure...")
-    fetch_infra(cloud, bucket_name)
+def fetch_all() -> tuple[ConfigTree, dict[str, list[str]]]:
+    """Fetch everything from remote. Returns (remote tree, dkim_tokens)."""
+    remote: ConfigTree = {}
 
     logger.info("  fetching identities...")
     dkim_tokens: dict[str, list[str]] = {}
-    identity_count = fetch_identities(cloud, sesv2, dkim_tokens)
+    identity_domains = fetch_identities(remote, dkim_tokens)
 
-    logger.info("  fetching receipt rule sets...")
-    rule_set_count = fetch_rule_sets(cloud, ses_client)
+    logger.info("  fetching SMTP users...")
+    smtp_user_count = fetch_smtp_users(remote, identity_domains)
 
-    logger.info("  %d identities, %d rule sets", identity_count, rule_set_count)
+    logger.info("  %d identities, %d SMTP users", len(identity_domains), smtp_user_count)
 
-    return cloud, dkim_tokens
+    logger.info("  SMTP credentials:")
+    log_credentials()
+
+    return remote, dkim_tokens
