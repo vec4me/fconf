@@ -555,6 +555,7 @@ def main() -> None:
     email_forwards: dict[str, str] = {
         "tattoocollectivereno.com": "tattoocollectivereno@gmail.com",
         "southtowntattoocollective.com": "tattoocollectivereno@gmail.com",
+        "hiroshimajobnavi.com": "info@clarkn.co.jp",
     }
     email_default_forward = "vec4me@icloud.com"
 
