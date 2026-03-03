@@ -5,17 +5,22 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path as FilePath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Final, TypedDict
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from mypy_boto3_iam.client import IAMClient
-    from mypy_boto3_sesv2.client import SESV2Client
-
     from provider import ConfigTree, Path
 
 logger = logging.getLogger(__name__)
+
+
+class SmtpCredential(TypedDict):
+    """SMTP credential stored on disk."""
+    host: str
+    port: int
+    username: str
+    password: str
 
 
 class State:
@@ -23,8 +28,9 @@ class State:
 
     def __init__(self) -> None:
         """Initialize empty clients."""
-        self.sesv2: SESV2Client | None = None
-        self.iam: IAMClient | None = None
+        super().__init__()
+        self.sesv2: Any = None
+        self.iam: Any = None
         self.region: str = ""
 
 
@@ -35,26 +41,26 @@ def init(region: str) -> None:
     """Initialize AWS service clients for the given region."""
     import boto3
     state.region = region
-    state.sesv2 = boto3.client("sesv2", region_name=region)
-    state.iam = boto3.client("iam")
+    state.sesv2 = boto3.client("sesv2", region_name=region)  # pyright: ignore[reportUnknownMemberType]
+    state.iam = boto3.client("iam")  # pyright: ignore[reportUnknownMemberType]
 
 
-CREDENTIALS_FILE = FilePath(__file__).parent / "smtp_credentials.json"
+CREDENTIALS_FILE: Final = FilePath(__file__).parent / "smtp_credentials.json"
 
 
-def load_credentials() -> dict[str, dict[str, object]]:
+def load_credentials() -> dict[str, SmtpCredential]:
     """Load stored SMTP credentials from disk."""
     if CREDENTIALS_FILE.exists():
         return json.loads(CREDENTIALS_FILE.read_text())
     return {}
 
 
-def write_credentials(credentials: dict[str, dict[str, object]]) -> None:
+def write_credentials(credentials: dict[str, SmtpCredential]) -> None:
     """Write all SMTP credentials to disk."""
     CREDENTIALS_FILE.write_text(json.dumps(credentials, indent=2) + "\n")
 
 
-def save_credential(domain: str, credential: dict[str, object]) -> None:
+def save_credential(domain: str, credential: SmtpCredential) -> None:
     """Save an SMTP credential for a domain to disk."""
     credentials = load_credentials()
     credentials[domain] = credential
@@ -121,7 +127,7 @@ def make_identity(
 
 # SMTP credentials
 
-SMTP_SIGNING_VERSION = b"\x04"
+SMTP_SIGNING_VERSION: Final = b"\x04"
 
 
 def derive_smtp_password(secret_access_key: str, region: str) -> str:

@@ -4,15 +4,41 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Literal
+from typing import Any, Final, Literal, TypedDict, cast
 
 logger = logging.getLogger(__name__)
 
-HTTP_OK = 200
-HTTP_CREATED = 201
-HTTP_NO_CONTENT = 204
-MAX_PAGES = 100
-PAGE_SIZE = 100
+HTTP_OK: Final = 200
+HTTP_CREATED: Final = 201
+HTTP_NO_CONTENT: Final = 204
+MAX_PAGES: Final = 100
+PAGE_SIZE: Final = 100
+
+HttpMethod = Literal["delete", "get", "patch", "post", "put"]
+
+
+class PhoneNumber(TypedDict, total=False):
+    """Phone number from Telnyx API."""
+    id: str
+    phone_number: str
+    connection_id: str | None
+    messaging_profile_id: str | None
+
+
+class Profile(TypedDict, total=False):
+    """Generic profile from Telnyx API."""
+    id: str
+    name: str
+    connection_name: str
+    phone_numbers_count: int
+
+
+class TelnyxData(TypedDict):
+    """Fetched Telnyx data structure."""
+    phone_numbers: dict[str, dict[str, Any]]
+    messaging_profiles: list[dict[str, Any]]
+    voice_profiles: list[dict[str, Any]]
+    credential_connections: list[dict[str, Any]]
 
 
 class State:
@@ -20,6 +46,7 @@ class State:
 
     def __init__(self) -> None:
         """Initialize empty credentials."""
+        super().__init__()
         self.headers: dict[str, str] = {}
 
 
@@ -37,7 +64,7 @@ def init(api_key: str | None = None) -> None:
 
 # Helpers
 def perform(
-    method: Literal["delete", "get", "patch", "post", "put"],
+    method: HttpMethod,
     url: str,
     json: dict[str, object] | None = None,
 ) -> object:
@@ -90,10 +117,10 @@ def paginate(endpoint: str) -> list[dict[str, object]]:
 
 
 # Fetchers
-def fetch_all() -> dict[str, object]:
+def fetch_all() -> TelnyxData:
     """Fetch everything from remote. Returns dict with phone_numbers, msg_profiles, voice_profiles, cred_connections."""
     logger.info("  fetching phone numbers...")
-    phone_numbers = {entry["phone_number"]: entry for entry in paginate("phone_numbers")}
+    phone_numbers = {str(entry["phone_number"]): entry for entry in paginate("phone_numbers")}
     logger.info("  fetching profiles and connections...")
     messaging_profiles = [
         profile for profile in paginate("messaging_profiles") if str(profile["name"]).startswith("msg-")
@@ -132,7 +159,7 @@ def unassign_phone_numbers(phone_numbers: dict[str, dict[str, object]]) -> None:
         )
 
 
-def delete_old_profiles(profile_data: dict[str, object]) -> None:
+def delete_old_profiles(profile_data: TelnyxData) -> None:
     """Delete existing credential connections, voice profiles, and messaging profiles."""
     logger.info("deleting...")
     for profile in profile_data["credential_connections"]:
@@ -155,23 +182,23 @@ def create_phone_config(
 ) -> None:
     """Create messaging profile, voice profile, and credential connection for a phone number."""
     logger.info("  %s", phone_number)
-    messaging_profile = perform("post", "messaging_profiles", {
+    messaging_profile = cast(dict[str, Any], perform("post", "messaging_profiles", {
         "name": f"msg-{phone_number}",
         "webhook_url": webhook_url,
         "webhook_api_version": "2",
         "whitelisted_destinations": ["*"],
-    })
+    }))
     logger.info("    messaging profile: ok")
 
-    voice_profile = perform("post", "outbound_voice_profiles", {
+    voice_profile = cast(dict[str, Any], perform("post", "outbound_voice_profiles", {
         "name": f"voice-{phone_number}",
         "traffic_type": "conversational",
         "service_plan": "global",
         "whitelisted_destinations": voice_destinations,
-    })
+    }))
     logger.info("    outbound voice profile: ok")
 
-    connection = perform("post", "credential_connections", {
+    connection = cast(dict[str, Any], perform("post", "credential_connections", {
         "connection_name": f"sip-{phone_number}",
         "user_name": f"user{phone_number[-4:]}",
         "password": sip_password,
@@ -182,10 +209,11 @@ def create_phone_config(
         "outbound": {
             "ani_override": phone_number,
             "ani_override_type": "always",
-            "outbound_voice_profile_id": voice_profile["id"],            "generate_ringback_tone": False,
+            "outbound_voice_profile_id": voice_profile["id"],
+            "generate_ringback_tone": False,
             "instant_ringback_enabled": False,
         },
-    })
+    }))
     logger.info("    credential connection: ok")
 
     apply_voice_settings(phone_number, data, connection, external_pin=external_pin, number_config=number_config)
@@ -199,7 +227,7 @@ def create_phone_config(
 def apply_voice_settings(
     phone_number: str,
     data: dict[str, object],
-    connection: object,
+    connection: dict[str, Any],
     *,
     external_pin: str,
     number_config: dict[str, dict[str, object]],
@@ -215,7 +243,7 @@ def apply_voice_settings(
     if phone_number in number_config and "call_forwarding" in number_config[phone_number]:
         voice_settings["call_forwarding"] = number_config[phone_number]["call_forwarding"]
 
-    voice_result = perform("patch", f"phone_numbers/{data['id']}/voice", voice_settings)
+    voice_result = cast(dict[str, Any], perform("patch", f"phone_numbers/{data['id']}/voice", voice_settings))
     media_features = voice_result["media_features"]
     logger.info(
         "    voice: hd=%s, rtp_auto=%s, t38=%s",
@@ -223,11 +251,11 @@ def apply_voice_settings(
         media_features["rtp_auto_adjust_enabled"],
         media_features["t38_fax_gateway_enabled"],
     )
-    result = perform("patch", f"phone_numbers/{data['id']}", {
+    result = cast(dict[str, Any], perform("patch", f"phone_numbers/{data['id']}", {
         "number_level_routing": "disabled",
         "external_pin": external_pin,
         "hd_voice_enabled": False,
-    })
+    }))
     logger.info("    external_pin: %s", result["external_pin"])
 
 def cleanup_profiles() -> None:
@@ -255,7 +283,7 @@ def cleanup_profiles() -> None:
 
 # Configure
 def configure(
-    profile_data: dict[str, object],
+    profile_data: TelnyxData,
     webhook_url: str,
     voice_destinations: list[str],
     sip_password: str,
@@ -264,7 +292,7 @@ def configure(
     number_config: dict[str, dict[str, object]],
 ) -> None:
     """Recreate all Telnyx profiles and connections for managed phone numbers."""
-    phone_numbers: dict[str, dict[str, object]] = profile_data["phone_numbers"]
+    phone_numbers = profile_data["phone_numbers"]
     if not phone_numbers:
         return
 

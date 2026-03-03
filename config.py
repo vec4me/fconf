@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import cloudflare as cf
 import provider
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Cloudflare
 # ============================================================
 
-CF_DKIM_RECORD = (
+CF_DKIM_RECORD: Final = (
     "v=DKIM1; h=sha256; k=rsa;"
     " p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAiweykoi+o48IOGuP7GR3X0MOExCUDY"
     "/BCRHoWBnh3rChl7WhdyCxW3jgq1daEjPPqoi7sJvdg5hEQVsgVRQP4DcnQDVjGMbASQtrY4WmB1"
@@ -31,7 +31,7 @@ CF_DKIM_RECORD = (
     "bTixDSJwIDAQAB"
 )
 
-ZONE_CONFIG: dict[str, dict[str, object]] = {
+ZONE_CONFIG: Final[dict[str, dict[str, object]]] = {
     "hiroshimajobnavi.com": {
         "address": "34.111.141.225",
         "ssl": "full",
@@ -95,7 +95,7 @@ def get_short_name(zone: dict[str, object]) -> str:
     return str(zone["name"]).split(".")[0]
 
 
-def find_service(collection: dict[str, object], name: str, suffixes: list[str]) -> str | None:
+def find_service(collection: dict[str, dict[str, object]], name: str, suffixes: list[str]) -> str | None:
     """Find a service in a collection by trying name+suffix combinations."""
     for suffix in suffixes:
         key = f"{name}{suffix}"
@@ -104,24 +104,24 @@ def find_service(collection: dict[str, object], name: str, suffixes: list[str]) 
     return None
 
 
-def find_worker(workers: dict[str, object], zone: dict[str, object]) -> str | None:
+def find_worker(workers: dict[str, dict[str, object]], zone: dict[str, object]) -> str | None:
     """Find the worker associated with a zone."""
     return find_service(workers, get_short_name(zone), ["", "-website"])
 
 
-def find_page(pages: dict[str, object], zone: dict[str, object]) -> str | None:
+def find_page(pages: dict[str, dict[str, object]], zone: dict[str, object]) -> str | None:
     """Find the page associated with a zone."""
     return find_service(pages, get_short_name(zone), ["", "-website"])
 
 
-def find_api_worker(workers: dict[str, object], zone: dict[str, object]) -> str | None:
+def find_api_worker(workers: dict[str, dict[str, object]], zone: dict[str, object]) -> str | None:
     """Find the API worker associated with a zone."""
     return find_service(workers, get_short_name(zone), ["-api", ""])
 
 
 def get_hosting_type(
-    workers: dict[str, object],
-    pages: dict[str, object],
+    workers: dict[str, dict[str, object]],
+    pages: dict[str, dict[str, object]],
     zone: dict[str, object],
 ) -> str | None:
     """Determine whether a zone is backed by a worker or a page."""
@@ -207,7 +207,7 @@ def configure_email(
 
 def configure_dns(
     local: ConfigTree,
-    workers: dict[str, object],
+    workers: dict[str, dict[str, object]],
     zone: dict[str, object],
     vps: str | None,
     hosting_type: str | None,
@@ -255,7 +255,8 @@ def configure_additional_records(local: ConfigTree, zone: dict[str, object]) -> 
     """Configure any additional DNS records specified in zone config."""
     additional_records = get_config(zone, "additional_records")
     if additional_records:
-        for name, record_type, content, proxied in additional_records:
+        records = cast(list[tuple[str, str, str, bool]], additional_records)
+        for name, record_type, content, proxied in records:
             cf.make_record(local, zone, name, record_type, content, proxied=proxied)
 
 
@@ -321,8 +322,8 @@ def configure_special_redirects(
 
 def configure_domains(
     local: ConfigTree,
-    workers: dict[str, object],
-    pages: dict[str, object],
+    workers: dict[str, dict[str, object]],
+    pages: dict[str, dict[str, object]],
     zone: dict[str, object],
     used_services: set[str],
     hosting_type: str | None,
@@ -332,7 +333,8 @@ def configure_domains(
 
     worker_domains = get_config(zone, "worker_domains")
     if worker_domains:
-        for worker_name, subdomain in worker_domains:
+        domains = cast(list[tuple[str, str]], worker_domains)
+        for worker_name, subdomain in domains:
             cf.make_worker_domain(local, worker_name, zone, f"{subdomain}.{zone['name']}")
             used_services.add(worker_name)
 
@@ -363,7 +365,8 @@ def configure_settings(
     settings: dict[str, object],
 ) -> None:
     """Configure zone settings from settings, respecting per-zone config."""
-    for setting_id, setting in zone["settings"].items():
+    zone_settings = cast(dict[str, dict[str, Any]], zone["settings"])
+    for setting_id, setting in zone_settings.items():
         if setting["editable"] and setting_id in settings:
             value = settings[setting_id]
             zone_override = get_config(zone, setting_id)
@@ -384,7 +387,7 @@ def configure_regery(
     """Configure Regery domains to use Cloudflare nameservers with auto-renew."""
     for zone in zones.values():
         name = str(zone["name"])
-        nameservers = zone.get("name_servers", [])
+        nameservers = cast(list[str], zone.get("name_servers", []))
         regery.make_domain(
             local,
             name=name,
@@ -417,7 +420,7 @@ def configure_ses(
 # Main
 # ============================================================
 
-DEFAULT_SETTINGS: dict[str, object] = {
+DEFAULT_SETTINGS: Final[dict[str, object]] = {
     "0rtt": "on",
     "always_online": "off",
     "always_use_https": "off",

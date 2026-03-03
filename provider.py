@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
+
+Action = Literal["remove", "push", "update"]
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +23,7 @@ class LeafNode(TypedDict):
 
 ConfigTree = dict[str, "ConfigTree | LeafNode"]
 Path = tuple[str, ...]
-Diff = tuple[Literal["remove", "push", "update"], Path, LeafNode]
+Diff = tuple[Action, Path, LeafNode]
 
 
 def set_tree(
@@ -32,11 +34,13 @@ def set_tree(
     remove_fn: Callable[[], None],
 ) -> None:
     """Set a leaf node in the config tree at the given path."""
+    current: ConfigTree = tree
     for key in path[:-1]:
-        if key not in tree:
-            tree[key] = {}
-        tree = dict.__getitem__(tree, key)
-    tree[path[-1]] = {"value": value, "push": push_fn, "remove": remove_fn}
+        if key not in current:
+            current[key] = {}
+        current = cast(ConfigTree, current[key])
+    leaf: LeafNode = {"value": value, "push": push_fn, "remove": remove_fn}
+    current[path[-1]] = leaf
 
 
 def is_leaf(node: ConfigTree | LeafNode) -> bool:
@@ -46,11 +50,11 @@ def is_leaf(node: ConfigTree | LeafNode) -> bool:
 
 def as_leaf(node: ConfigTree | LeafNode) -> LeafNode:
     """Narrow a node to LeafNode after checking is_leaf."""
-    return node
+    return cast(LeafNode, node)
 
 def as_tree(node: ConfigTree | LeafNode) -> ConfigTree:
     """Narrow a node to ConfigTree after checking it is not a leaf."""
-    return node
+    return cast(ConfigTree, node)
 
 def diff_one_sided(
     source: ConfigTree,
@@ -120,7 +124,7 @@ def get_node(remote: ConfigTree, path: Path) -> LeafNode | None:
 
 def dict_delta(old: dict[str, object], new: dict[str, object]) -> list[str]:
     """Compute per-key changes between two dicts."""
-    changes = []
+    changes: list[str] = []
     for key in sorted(set(old.keys()) | set(new.keys())):
         old_val = old.get(key)
         new_val = new.get(key)
@@ -141,7 +145,9 @@ def log_diffs(diffs: list[Diff], remote: ConfigTree) -> None:
             remote_node = get_node(remote, path)
             logger.info("update: %s", path_str)
             if remote_node:
-                for change in dict_delta(remote_node["value"], node["value"]):
+                remote_val = cast(dict[str, object], remote_node["value"])
+                local_val = cast(dict[str, object], node["value"])
+                for change in dict_delta(remote_val, local_val):
                     logger.info("%s", change)
         else:
             msg = f"unknown action: {action}"

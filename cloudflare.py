@@ -4,25 +4,79 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, NewType, TypedDict, cast
 
 if TYPE_CHECKING:
     from provider import ConfigTree, Path
 
+# Type aliases
+ZoneId = NewType("ZoneId", str)
+RecordId = NewType("RecordId", str)
+RecordType = Literal["A", "AAAA", "CNAME", "MX", "TXT", "SRV", "NS", "CAA", "PTR"]
+HttpMethod = Literal["delete", "get", "patch", "post", "put"]
+
+
+class DnsRecordData(TypedDict, total=False):
+    """SRV record data fields."""
+    service: str
+    proto: str
+    name: str
+    priority: int
+    weight: int
+    port: int
+    target: str
+
+
+class DnsRecord(TypedDict, total=False):
+    """DNS record from Cloudflare API."""
+    id: str
+    zone_id: str
+    zone_name: str
+    name: str
+    type: RecordType
+    content: str
+    proxied: bool
+    ttl: int
+    priority: int
+    locked: bool
+    data: DnsRecordData
+    meta: dict[str, Any]
+    comment: str | None
+    tags: list[str]
+    settings: dict[str, Any]
+
+
+class ZoneSetting(TypedDict, total=False):
+    """Zone setting from Cloudflare API."""
+    id: str
+    value: Any
+    editable: bool
+    modified_on: str
+
+
+class Zone(TypedDict, total=False):
+    """Zone from Cloudflare API."""
+    id: str
+    name: str
+    name_servers: list[str]
+    settings: dict[str, ZoneSetting]
+    dnssec: dict[str, Any]
+
 logger = logging.getLogger(__name__)
 
-HTTP_OK = 200
-HTTP_CREATED = 201
-HTTP_NO_CONTENT = 204
-MAX_PAGES = 100
-PER_PAGE = 10
-DNS_TXT_MAX = 255
+HTTP_OK: Final = 200
+HTTP_CREATED: Final = 201
+HTTP_NO_CONTENT: Final = 204
+MAX_PAGES: Final = 100
+PER_PAGE: Final = 10
+DNS_TXT_MAX: Final = 255
 
 class State:
     """Module-level mutable state for Cloudflare API credentials."""
 
     def __init__(self) -> None:
         """Initialize empty credentials."""
+        super().__init__()
         self.headers: dict[str, str] = {}
         self.account_id: str | None = None
 
@@ -44,7 +98,7 @@ def init(
 
 
 def perform(
-    method: Literal["delete", "get", "patch", "post", "put"],
+    method: HttpMethod,
     url: str,
     json: dict[str, object] | None = None,
 ) -> object:
@@ -239,7 +293,22 @@ def remove_dns_record(zone_id: str, record_id: str | None) -> None:
     try:
         delete(f"zones/{zone_id}/dns_records/{record_id}")
     except RuntimeError as e:
-        if "does not exist" in str(e):
+        err = str(e)
+        if "does not exist" in err:
+            return
+        if "managed by Email Routing" in err:
+            logger.info("disabling Email Routing to delete managed record %s", record_id)
+            try:
+                post(f"zones/{zone_id}/email/routing/disable", {})
+            except RuntimeError as disable_err:
+                if "already disabled" not in str(disable_err).lower():
+                    raise
+            # Record may have been auto-deleted when Email Routing was disabled
+            try:
+                delete(f"zones/{zone_id}/dns_records/{record_id}")
+            except RuntimeError as retry_err:
+                if "does not exist" not in str(retry_err):
+                    raise
             return
         raise
 
@@ -300,7 +369,7 @@ def build_srv_from_remote_data(
     parts = name_str.split(".")
     service = parts[0]
     proto = parts[1] if len(parts) > 1 else ""
-    data = remote_data["data"]
+    data = cast(dict[str, Any], remote_data["data"])
     target = str(data["target"])
     value: dict[str, object] = {
         "name": str(remote_data["name"]),
@@ -414,7 +483,7 @@ def make_route(
     set_tree(tree, path, value, push, remove)
 
 
-def get_redirect_rules(zone: dict[str, object]) -> dict[str, object] | None:
+def get_redirect_rules(zone: dict[str, object]) -> dict[str, Any] | None:
     """Fetch the redirect ruleset for a zone. Returns None if no ruleset exists."""
     try:
         result = get(f"zones/{zone['id']}/rulesets/phases/http_request_dynamic_redirect/entrypoint")
@@ -423,7 +492,7 @@ def get_redirect_rules(zone: dict[str, object]) -> dict[str, object] | None:
             return None
         raise
     if isinstance(result, dict):
-        return result
+        return cast(dict[str, Any], result)
     return None
 
 
@@ -468,13 +537,15 @@ def make_redirect_rule(    tree: ConfigTree,
     def remove() -> None:
         ruleset = get_redirect_rules(zone)
         if ruleset and ruleset["rules"]:
-            new_rules = [rule for rule in ruleset["rules"] if rule["id"] != rule_id]
+            rules = cast(list[dict[str, object]], ruleset["rules"])
+            new_rules = [rule for rule in rules if rule["id"] != rule_id]
             put(f"zones/{zone_id}/rulesets/{ruleset['id']}", {"rules": new_rules})
 
     def push() -> None:
         ruleset = get_redirect_rules(zone)
         if ruleset:
-            existing_rules = [*ruleset["rules"], value]
+            rules = cast(list[dict[str, object]], ruleset["rules"])
+            existing_rules: list[dict[str, object]] = [*rules, value]
             put(f"zones/{zone_id}/rulesets/{ruleset['id']}", {"rules": existing_rules})
         else:
             post(f"zones/{zone_id}/rulesets", {
@@ -681,7 +752,8 @@ def fetch_zone(
     for record in records:
         if record["type"] == "AAAA" and str(record["content"]).startswith("100::"):
             continue
-        if record.get("meta", {}).get("auto_added"):
+        meta = cast(dict[str, object], record.get("meta", {}))
+        if meta.get("auto_added"):
             continue
         if record.get("locked"):
             continue
@@ -693,26 +765,31 @@ def fetch_zone(
         make_route(remote, zone, remote_data=route)
 
     try:
-        catch_all = get(f"zones/{zone_id}/email/routing/rules/catch_all")
-        if isinstance(catch_all, dict) and catch_all.get("enabled"):
-            make_email_routing_catch_all(remote, zone, remote_data=catch_all)
+        catch_all_result = get(f"zones/{zone_id}/email/routing/rules/catch_all")
+        if isinstance(catch_all_result, dict):
+            catch_all = cast(dict[str, object], catch_all_result)
+            if catch_all.get("enabled"):
+                make_email_routing_catch_all(remote, zone, remote_data=catch_all)
     except RuntimeError as e:
         if "not_found" not in str(e).lower() and "not enabled" not in str(e).lower():
             raise
         # email routing not enabled for this zone
 
-    for setting in zone["settings"].values():
+    settings = cast(dict[str, dict[str, object]], zone["settings"])
+    for setting in settings.values():
         if setting["editable"] and setting["id"] in setting_ids:
             make_setting(remote, zone, remote_data=setting)
         elif setting["editable"]:
             all_missing.add(str(setting["id"]))
         else:
             pass  # non-editable setting, skip
-    if zone.get("dnssec"):
-        make_dnssec(remote, zone, remote_data=zone["dnssec"])
+    dnssec = zone.get("dnssec")
+    if dnssec:
+        make_dnssec(remote, zone, remote_data=cast(dict[str, object], dnssec))
     redirect_ruleset = get_redirect_rules(zone)
     if redirect_ruleset and redirect_ruleset.get("rules"):
-        for rule in redirect_ruleset["rules"]:
+        rules = cast(list[dict[str, object]], redirect_ruleset["rules"])
+        for rule in rules:
             make_redirect_rule(remote, zone, remote_data=rule)
 
 def fetch_all(
@@ -725,14 +802,14 @@ def fetch_all(
     logger.info("  fetching zones...")
     if zone_list is None:
         zone_list = paginate("zones")
-    zones: dict[str, dict[str, object]] = {zone["id"]: zone for zone in zone_list}
+    zones: dict[str, dict[str, object]] = {str(zone["id"]): zone for zone in zone_list}
     logger.info("  fetching workers...")
     workers: dict[str, dict[str, object]] = {
-        worker["id"]: worker for worker in paginate(f"accounts/{state.account_id}/workers/scripts")
+        str(worker["id"]): worker for worker in paginate(f"accounts/{state.account_id}/workers/scripts")
     }
     logger.info("  fetching pages...")
     pages: dict[str, dict[str, object]] = {
-        project["name"]: project for project in paginate(f"accounts/{state.account_id}/pages/projects")
+        str(project["name"]): project for project in paginate(f"accounts/{state.account_id}/pages/projects")
     }
 
     logger.info("  fetching page domains...")

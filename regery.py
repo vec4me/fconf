@@ -4,16 +4,42 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 
 if TYPE_CHECKING:
     from provider import ConfigTree, Path
 
 logger = logging.getLogger(__name__)
 
-HTTP_OK = 200
-MAX_PAGES = 100
-DEFAULT_LIMIT = 50
+HTTP_OK: Final = 200
+MAX_PAGES: Final = 100
+DEFAULT_LIMIT: Final = 50
+
+HttpMethod = Literal["get", "patch", "post"]
+
+
+class DomainNameservers(TypedDict, total=False):
+    """Nameserver configuration from Regery API."""
+    provider: str | None
+    list: list[str]
+
+
+class DomainContacts(TypedDict, total=False):
+    """Domain contacts configuration."""
+    registrant: str
+    admin: str
+    tech: str
+    billing: str
+    services: list[str]
+    disclose: bool
+
+
+class Domain(TypedDict, total=False):
+    """Domain from Regery API."""
+    name: str
+    autoRenew: bool
+    nameservers: DomainNameservers
+    contacts: DomainContacts
 
 
 class State:
@@ -21,6 +47,7 @@ class State:
 
     def __init__(self) -> None:
         """Initialize empty credentials."""
+        super().__init__()
         self.headers: dict[str, str] = {}
 
 
@@ -38,7 +65,7 @@ def init(api_key: str | None = None, api_secret: str | None = None) -> None:
 
 
 def perform(
-    method: Literal["get", "patch", "post"],
+    method: HttpMethod,
     url: str,
     json: dict[str, object] | None = None,
 ) -> object:
@@ -101,9 +128,12 @@ def paginate(url: str) -> list[dict[str, object]]:
 def domain_value(domain: dict[str, object]) -> dict[str, object]:
     """Extract the diffable value from a domain response."""
     nameservers = domain["nameservers"]
+    ns_list: list[str] = []
+    if isinstance(nameservers, dict) and "list" in nameservers:
+        ns_list = sorted(cast(list[str], nameservers["list"]))
     return {
         "autoRenew": domain["autoRenew"],
-        "nameservers": sorted(nameservers["list"]) if isinstance(nameservers, dict) and "list" in nameservers else [],
+        "nameservers": ns_list,
         "contacts": domain["contacts"],
     }
 
@@ -116,17 +146,19 @@ def build_domain_value(
     contacts: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build a domain value dict from explicit arguments."""
+    ns_list: list[str] = sorted(nameservers) if nameservers else []
     return {
         "autoRenew": auto_renew,
-        "nameservers": sorted(nameservers) if nameservers else [],
+        "nameservers": ns_list,
         "contacts": contacts if contacts is not None else {},
     }
 
 
-def make_domain(    tree: ConfigTree,
+def make_domain(
+    tree: ConfigTree,
     name: str | None = None,
     *,
-    auto_renew: bool | None = None,
+    auto_renew: bool = True,
     nameservers: list[str] | None = None,
     contacts: dict[str, object] | None = None,
     remote_data: dict[str, object] | None = None,
