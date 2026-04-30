@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, Final, Literal, NewType, TypedDict, cast
+from typing import Any, Final, Literal, NewType, TypedDict, cast
 
-if TYPE_CHECKING:
-    from provider import ConfigTree, Path
+import requests
+
+from provider import ConfigTree, Path, set_tree
 
 # Type aliases
 ZoneId = NewType("ZoneId", str)
@@ -18,6 +19,7 @@ HttpMethod = Literal["delete", "get", "patch", "post", "put"]
 
 class DnsRecordData(TypedDict, total=False):
     """SRV record data fields."""
+
     service: str
     proto: str
     name: str
@@ -29,6 +31,7 @@ class DnsRecordData(TypedDict, total=False):
 
 class DnsRecord(TypedDict, total=False):
     """DNS record from Cloudflare API."""
+
     id: str
     zone_id: str
     zone_name: str
@@ -48,6 +51,7 @@ class DnsRecord(TypedDict, total=False):
 
 class ZoneSetting(TypedDict, total=False):
     """Zone setting from Cloudflare API."""
+
     id: str
     value: Any
     editable: bool
@@ -56,6 +60,7 @@ class ZoneSetting(TypedDict, total=False):
 
 class Zone(TypedDict, total=False):
     """Zone from Cloudflare API."""
+
     id: str
     name: str
     name_servers: list[str]
@@ -103,7 +108,6 @@ def perform(
     json: dict[str, object] | None = None,
 ) -> object:
     """Execute an HTTP request against the Cloudflare API."""
-    import requests
     response = requests.request(
         method,
         f"https://api.cloudflare.com/client/v4/{url}",
@@ -112,7 +116,7 @@ def perform(
         timeout=30,
     )
     if response.status_code in (HTTP_OK, HTTP_CREATED, HTTP_NO_CONTENT):
-        if response.status_code == HTTP_NO_CONTENT:
+        if response.status_code == HTTP_NO_CONTENT or not response.text:
             return True
         return response.json()["result"]
     try:
@@ -174,13 +178,12 @@ def filter_keys(source: dict[str, object], skip: tuple[str, ...]) -> dict[str, o
 # Resource makers
 def make_setting(
     tree: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     setting_id: str | None = None,
     setting_value: object = None,
-    remote_data: dict[str, object] | None = None,
+    remote_data: ZoneSetting | None = None,
 ) -> None:
     """Build a zone setting node in the config tree."""
-    from provider import set_tree
     zone_name = zone["name"]
     zone_id = zone["id"]
 
@@ -206,12 +209,11 @@ def make_setting(
 
 def make_dnssec(
     tree: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     status: str = "disabled",
     remote_data: dict[str, object] | None = None,
 ) -> None:
     """Build a DNSSEC node in the config tree."""
-    from provider import set_tree
     zone_name = zone["name"]
     zone_id = zone["id"]
 
@@ -233,7 +235,7 @@ def make_dnssec(
 
 def build_record_from_remote_data(
     zone_name: str,
-    remote_data: dict[str, object],
+    remote_data: DnsRecord,
 ) -> tuple[str, str, str, dict[str, object], str | None]:
     """Extract record fields from a remote record dict."""
     record_id = str(remote_data["id"])
@@ -246,8 +248,18 @@ def build_record_from_remote_data(
         name = name_str
     content = str(remote_data["content"])
     record_type = str(remote_data["type"])
-    skip: tuple[str, ...] = ("id", "zone_id", "zone_name", "created_on", "modified_on", "meta", "proxiable")
-    value: dict[str, object] = filter_keys(remote_data, skip)
+    value: dict[str, object] = {
+        "content": content,
+        "name": remote_data["name"],
+        "proxied": remote_data["proxied"],
+        "ttl": remote_data["ttl"],
+        "type": record_type,
+        "comment": remote_data["comment"],
+        "tags": remote_data["tags"],
+        "settings": remote_data["settings"],
+    }
+    if "priority" in remote_data:
+        value["priority"] = remote_data["priority"]
     return name, content, record_type, value, record_id
 
 
@@ -314,7 +326,7 @@ def remove_dns_record(zone_id: str, record_id: str | None) -> None:
 
 
 def make_record(    tree: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     name: str | None = None,
     record_type: str | None = None,
     content: str | None = None,
@@ -322,10 +334,9 @@ def make_record(    tree: ConfigTree,
     proxied: bool = True,
     priority: int | None = None,
     ttl: int = 1,
-    remote_data: dict[str, object] | None = None,
+    remote_data: DnsRecord | None = None,
 ) -> None:
     """Build a DNS record node in the config tree."""
-    from provider import set_tree
     zone_name = str(zone["name"])
     zone_id = str(zone["id"])
     record_id: str | None = None
@@ -361,7 +372,7 @@ def make_record(    tree: ConfigTree,
 
 def build_srv_from_remote_data(
     zone_name: str,
-    remote_data: dict[str, object],
+    remote_data: DnsRecord,
 ) -> tuple[str, str, dict[str, object], str]:
     """Extract SRV record fields from a remote record dict."""
     record_id = str(remote_data["id"])
@@ -369,7 +380,7 @@ def build_srv_from_remote_data(
     parts = name_str.split(".")
     service = parts[0]
     proto = parts[1] if len(parts) > 1 else ""
-    data = cast(dict[str, Any], remote_data["data"])
+    data = cast("dict[str, Any]", remote_data["data"])
     target = str(data["target"])
     value: dict[str, object] = {
         "name": str(remote_data["name"]),
@@ -391,17 +402,16 @@ def build_srv_from_remote_data(
 
 def make_srv_record(
     tree: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     service: str | None = None,
     proto: str | None = None,
     target: str | None = None,
     port: int | None = None,
     priority: int = 10,
     weight: int = 10,
-    remote_data: dict[str, object] | None = None,
+    remote_data: DnsRecord | None = None,
 ) -> None:
     """Build an SRV DNS record node in the config tree."""
-    from provider import set_tree
     zone_name = str(zone["name"])
     zone_id = zone["id"]
     record_id: str | None = None
@@ -449,13 +459,12 @@ def make_srv_record(
 
 def make_route(
     tree: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     pattern: str | None = None,
     script: str | None = None,
     remote_data: dict[str, object] | None = None,
 ) -> None:
     """Build a Workers route node in the config tree."""
-    from provider import set_tree
     zone_name = str(zone["name"])
     zone_id = zone["id"]
     route_id: str | None = None
@@ -463,7 +472,11 @@ def make_route(
     if remote_data:
         route_id = str(remote_data["id"])
         pattern = str(remote_data["pattern"])
-        value: dict[str, object] = filter_keys(remote_data, ("id",))
+        value: dict[str, object] = {
+            "pattern": pattern,
+            "script": remote_data["script"],
+            "request_limit_fail_open": remote_data["request_limit_fail_open"],
+        }
     else:
         if pattern is None:
             msg = f"{zone_name} route, missing pattern"
@@ -483,7 +496,7 @@ def make_route(
     set_tree(tree, path, value, push, remove)
 
 
-def get_redirect_rules(zone: dict[str, object]) -> dict[str, Any] | None:
+def get_redirect_rules(zone: Zone) -> dict[str, Any] | None:
     """Fetch the redirect ruleset for a zone. Returns None if no ruleset exists."""
     try:
         result = get(f"zones/{zone['id']}/rulesets/phases/http_request_dynamic_redirect/entrypoint")
@@ -492,19 +505,18 @@ def get_redirect_rules(zone: dict[str, object]) -> dict[str, Any] | None:
             return None
         raise
     if isinstance(result, dict):
-        return cast(dict[str, Any], result)
+        return cast("dict[str, Any]", result)
     return None
 
 
 def make_redirect_rule(    tree: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     expression: str | None = None,
     target_url: str | None = None,
     status_code: int = 301,
     remote_data: dict[str, object] | None = None,
 ) -> None:
     """Build a redirect rule node in the config tree."""
-    from provider import set_tree
     zone_name = str(zone["name"])
     zone_id = zone["id"]
     rule_id: str | None = None
@@ -512,8 +524,12 @@ def make_redirect_rule(    tree: ConfigTree,
     if remote_data:
         expression = str(remote_data["expression"])
         rule_id = str(remote_data["id"])
-        skip_keys = ("id", "ref", "version", "last_updated")
-        value: dict[str, object] = filter_keys(remote_data, skip_keys)
+        value: dict[str, object] = {
+            "expression": expression,
+            "action": remote_data["action"],
+            "action_parameters": remote_data["action_parameters"],
+            "enabled": remote_data["enabled"],
+        }
     else:
         if expression is None:
             msg = f"{zone_name} redirect rule, missing expression"
@@ -537,14 +553,14 @@ def make_redirect_rule(    tree: ConfigTree,
     def remove() -> None:
         ruleset = get_redirect_rules(zone)
         if ruleset and ruleset["rules"]:
-            rules = cast(list[dict[str, object]], ruleset["rules"])
+            rules = cast("list[dict[str, object]]", ruleset["rules"])
             new_rules = [rule for rule in rules if rule["id"] != rule_id]
             put(f"zones/{zone_id}/rulesets/{ruleset['id']}", {"rules": new_rules})
 
     def push() -> None:
         ruleset = get_redirect_rules(zone)
         if ruleset:
-            rules = cast(list[dict[str, object]], ruleset["rules"])
+            rules = cast("list[dict[str, object]]", ruleset["rules"])
             existing_rules: list[dict[str, object]] = [*rules, value]
             put(f"zones/{zone_id}/rulesets/{ruleset['id']}", {"rules": existing_rules})
         else:
@@ -567,14 +583,9 @@ def make_page_domain(
     remote_data: dict[str, object] | None = None,
 ) -> None:
     """Build a Pages custom domain node in the config tree."""
-    from provider import set_tree
-    skip_keys = (
-        "id", "created_on", "status", "validation_data",
-        "verification_data", "domain_id", "certificate_authority", "zone_tag",
-    )
     if remote_data:
         hostname = str(remote_data["name"])
-        value: dict[str, object] = filter_keys(remote_data, skip_keys)
+        value: dict[str, object] = {"name": hostname}
     else:
         if hostname is None:
             msg = f"{page_name} page domain, missing hostname"
@@ -594,12 +605,11 @@ def make_page_domain(
 def make_worker_domain(
     tree: ConfigTree,
     worker_name: str,
-    zone: dict[str, object],
+    zone: Zone,
     hostname: str | None = None,
     remote_data: dict[str, object] | None = None,
 ) -> None:
     """Build a Workers custom domain node in the config tree."""
-    from provider import set_tree
     zone_id = zone["id"]
     domain_id: str | None = None
 
@@ -617,6 +627,8 @@ def make_worker_domain(
             "zone_id": zone_id,
             "service": worker_name,
             "environment": "production",
+            "enabled": True,
+            "previews_enabled": False,
         }
 
     def remove() -> None:
@@ -631,21 +643,20 @@ def make_worker_domain(
 
 def make_email_routing_catch_all(
     tree: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     forward_to: str | None = None,
     *,
     remote_data: dict[str, object] | None = None,
 ) -> None:
     """Build an email routing catch-all rule node in the config tree."""
-    from provider import set_tree
     zone_name = str(zone["name"])
     zone_id = str(zone["id"])
 
     if remote_data:
         value: dict[str, object] = {
-            "enabled": remote_data.get("enabled", False),
-            "actions": remote_data.get("actions", []),
-            "matchers": remote_data.get("matchers", []),
+            "enabled": remote_data["enabled"],
+            "actions": remote_data["actions"],
+            "matchers": remote_data["matchers"],
         }
     else:
         if forward_to is None:
@@ -671,6 +682,11 @@ def make_email_routing_catch_all(
             "actions": [{"type": "drop"}],
             "matchers": [{"type": "all"}],
         })
+        try:
+            post(f"zones/{zone_id}/email/routing/disable", {})
+        except RuntimeError as e:
+            if "already disabled" not in str(e).lower():
+                raise
 
     path: Path = ("zones", zone_name, "email_routing_catch_all")
     set_tree(tree, path, value, push, remove)
@@ -696,7 +712,6 @@ def ensure_destination_addresses(forward_addresses: set[str]) -> None:
 # Fetchers
 def paginate(url: str) -> list[dict[str, object]]:
     """Fetch all pages from a paginated Cloudflare API endpoint."""
-    import requests
     results: list[dict[str, object]] = []
     page = 1
     separator = "&" if "?" in url else "?"
@@ -732,9 +747,50 @@ def paginate(url: str) -> list[dict[str, object]]:
     return results
 
 
+def is_managed_record(record: dict[str, object]) -> bool:
+    """Check whether a DNS record is auto-managed and should be skipped."""
+    if record["type"] == "AAAA" and str(record["content"]).startswith("100::"):
+        return True
+    meta = cast("dict[str, object]", record.get("meta", {}))
+    return bool(meta.get("auto_added")) or bool(record.get("locked"))
+
+
+def fetch_email_routing(remote: ConfigTree, zone: Zone) -> None:
+    """Fetch email routing catch-all rule for a zone."""
+    try:
+        catch_all_result = get(f"zones/{zone['id']}/email/routing/rules/catch_all")
+        if isinstance(catch_all_result, dict):
+            catch_all = cast("dict[str, object]", catch_all_result)
+            if catch_all.get("enabled"):
+                make_email_routing_catch_all(remote, zone, remote_data=catch_all)
+    except RuntimeError as e:
+        if "not_found" not in str(e).lower() and "not enabled" not in str(e).lower():
+            raise
+
+
+def fetch_zone_settings(
+    remote: ConfigTree,
+    zone: Zone,
+    setting_ids: set[str],
+    all_missing: set[str],
+) -> None:
+    """Fetch settings, DNSSEC, and redirect rules for a zone."""
+    for setting in cast("dict[str, dict[str, object]]", zone["settings"]).values():
+        if setting["editable"] and setting["id"] in setting_ids:
+            make_setting(remote, zone, remote_data=setting)
+        elif setting["editable"]:
+            all_missing.add(str(setting["id"]))
+    if zone.get("dnssec"):
+        make_dnssec(remote, zone, remote_data=cast("dict[str, object]", zone["dnssec"]))
+    redirect_ruleset = get_redirect_rules(zone)
+    if redirect_ruleset and redirect_ruleset.get("rules"):
+        for rule in cast("list[dict[str, object]]", redirect_ruleset["rules"]):
+            make_redirect_rule(remote, zone, remote_data=rule)
+
+
 def fetch_zone(
     remote: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     setting_ids: set[str],
     all_missing: set[str],
 ) -> None:
@@ -744,18 +800,12 @@ def fetch_zone(
     records = paginate(f"zones/{zone_id}/dns_records")
     routes = paginate(f"zones/{zone_id}/workers/routes")
     settings = paginate(f"zones/{zone_id}/settings")
-    dnssec = get(f"zones/{zone_id}/dnssec")
 
     zone["settings"] = {setting["id"]: setting for setting in settings}
-    zone["dnssec"] = dnssec
+    zone["dnssec"] = get(f"zones/{zone_id}/dnssec")
 
     for record in records:
-        if record["type"] == "AAAA" and str(record["content"]).startswith("100::"):
-            continue
-        meta = cast(dict[str, object], record.get("meta", {}))
-        if meta.get("auto_added"):
-            continue
-        if record.get("locked"):
+        if is_managed_record(record):
             continue
         if record["type"] == "SRV":
             make_srv_record(remote, zone, remote_data=record)
@@ -764,45 +814,20 @@ def fetch_zone(
     for route in routes:
         make_route(remote, zone, remote_data=route)
 
-    try:
-        catch_all_result = get(f"zones/{zone_id}/email/routing/rules/catch_all")
-        if isinstance(catch_all_result, dict):
-            catch_all = cast(dict[str, object], catch_all_result)
-            if catch_all.get("enabled"):
-                make_email_routing_catch_all(remote, zone, remote_data=catch_all)
-    except RuntimeError as e:
-        if "not_found" not in str(e).lower() and "not enabled" not in str(e).lower():
-            raise
-        # email routing not enabled for this zone
-
-    settings = cast(dict[str, dict[str, object]], zone["settings"])
-    for setting in settings.values():
-        if setting["editable"] and setting["id"] in setting_ids:
-            make_setting(remote, zone, remote_data=setting)
-        elif setting["editable"]:
-            all_missing.add(str(setting["id"]))
-        else:
-            pass  # non-editable setting, skip
-    dnssec = zone.get("dnssec")
-    if dnssec:
-        make_dnssec(remote, zone, remote_data=cast(dict[str, object], dnssec))
-    redirect_ruleset = get_redirect_rules(zone)
-    if redirect_ruleset and redirect_ruleset.get("rules"):
-        rules = cast(list[dict[str, object]], redirect_ruleset["rules"])
-        for rule in rules:
-            make_redirect_rule(remote, zone, remote_data=rule)
+    fetch_email_routing(remote, zone)
+    fetch_zone_settings(remote, zone, setting_ids, all_missing)
 
 def fetch_all(
     setting_ids: set[str],
-    zone_list: list[dict[str, object]] | None = None,
-) -> tuple[ConfigTree, dict[str, dict[str, object]], dict[str, dict[str, object]], dict[str, dict[str, object]]]:
+    zone_list: list[Zone] | None = None,
+) -> tuple[ConfigTree, dict[str, Zone], dict[str, dict[str, object]], dict[str, dict[str, object]]]:
     """Fetch everything from remote. Returns (remote, zones, workers, pages)."""
     remote: ConfigTree = {}
 
     logger.info("  fetching zones...")
     if zone_list is None:
         zone_list = paginate("zones")
-    zones: dict[str, dict[str, object]] = {str(zone["id"]): zone for zone in zone_list}
+    zones: dict[str, Zone] = {str(zone["id"]): zone for zone in zone_list}
     logger.info("  fetching workers...")
     workers: dict[str, dict[str, object]] = {
         str(worker["id"]): worker for worker in paginate(f"accounts/{state.account_id}/workers/scripts")

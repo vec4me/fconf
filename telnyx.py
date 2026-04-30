@@ -6,6 +6,8 @@ import logging
 import os
 from typing import Any, Final, Literal, TypedDict, cast
 
+import requests
+
 logger = logging.getLogger(__name__)
 
 HTTP_OK: Final = 200
@@ -19,6 +21,7 @@ HttpMethod = Literal["delete", "get", "patch", "post", "put"]
 
 class PhoneNumber(TypedDict, total=False):
     """Phone number from Telnyx API."""
+
     id: str
     phone_number: str
     connection_id: str | None
@@ -27,6 +30,7 @@ class PhoneNumber(TypedDict, total=False):
 
 class Profile(TypedDict, total=False):
     """Generic profile from Telnyx API."""
+
     id: str
     name: str
     connection_name: str
@@ -35,6 +39,7 @@ class Profile(TypedDict, total=False):
 
 class TelnyxData(TypedDict):
     """Fetched Telnyx data structure."""
+
     phone_numbers: dict[str, dict[str, Any]]
     messaging_profiles: list[dict[str, Any]]
     voice_profiles: list[dict[str, Any]]
@@ -69,8 +74,6 @@ def perform(
     json: dict[str, object] | None = None,
 ) -> object:
     """Execute an HTTP request against the Telnyx API."""
-    import requests
-
     response = requests.request(
         method, f"https://api.telnyx.com/v2/{url}",
         headers=state.headers, json=json, timeout=30,
@@ -89,7 +92,6 @@ def perform(
 
 def paginate(endpoint: str) -> list[dict[str, object]]:
     """Fetch all pages from a paginated Telnyx API endpoint."""
-    import requests
     results: list[dict[str, object]] = []
     page = 1
     while page < MAX_PAGES:
@@ -182,7 +184,7 @@ def create_phone_config(
 ) -> None:
     """Create messaging profile, voice profile, and credential connection for a phone number."""
     logger.info("  %s", phone_number)
-    messaging_profile = cast(dict[str, Any], perform("post", "messaging_profiles", {
+    messaging_profile = cast("dict[str, Any]", perform("post", "messaging_profiles", {
         "name": f"msg-{phone_number}",
         "webhook_url": webhook_url,
         "webhook_api_version": "2",
@@ -190,7 +192,7 @@ def create_phone_config(
     }))
     logger.info("    messaging profile: ok")
 
-    voice_profile = cast(dict[str, Any], perform("post", "outbound_voice_profiles", {
+    voice_profile = cast("dict[str, Any]", perform("post", "outbound_voice_profiles", {
         "name": f"voice-{phone_number}",
         "traffic_type": "conversational",
         "service_plan": "global",
@@ -198,7 +200,7 @@ def create_phone_config(
     }))
     logger.info("    outbound voice profile: ok")
 
-    connection = cast(dict[str, Any], perform("post", "credential_connections", {
+    connection = cast("dict[str, Any]", perform("post", "credential_connections", {
         "connection_name": f"sip-{phone_number}",
         "user_name": f"user{phone_number[-4:]}",
         "password": sip_password,
@@ -243,7 +245,7 @@ def apply_voice_settings(
     if phone_number in number_config and "call_forwarding" in number_config[phone_number]:
         voice_settings["call_forwarding"] = number_config[phone_number]["call_forwarding"]
 
-    voice_result = cast(dict[str, Any], perform("patch", f"phone_numbers/{data['id']}/voice", voice_settings))
+    voice_result = cast("dict[str, Any]", perform("patch", f"phone_numbers/{data['id']}/voice", voice_settings))
     media_features = voice_result["media_features"]
     logger.info(
         "    voice: hd=%s, rtp_auto=%s, t38=%s",
@@ -251,7 +253,7 @@ def apply_voice_settings(
         media_features["rtp_auto_adjust_enabled"],
         media_features["t38_fax_gateway_enabled"],
     )
-    result = cast(dict[str, Any], perform("patch", f"phone_numbers/{data['id']}", {
+    result = cast("dict[str, Any]", perform("patch", f"phone_numbers/{data['id']}", {
         "number_level_routing": "disabled",
         "external_pin": external_pin,
         "hd_voice_enabled": False,

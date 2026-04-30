@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path as FilePath
-from typing import TYPE_CHECKING, Any, Final, TypedDict
+from typing import Any, Final, TypedDict
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
+import boto3
+from botocore.exceptions import ClientError
 
-    from provider import ConfigTree, Path
+from provider import ConfigTree, Path, set_tree
 
 logger = logging.getLogger(__name__)
 
 
 class SmtpCredential(TypedDict):
     """SMTP credential stored on disk."""
+
     host: str
     port: int
     username: str
@@ -39,7 +44,6 @@ state = State()
 
 def init(region: str) -> None:
     """Initialize AWS service clients for the given region."""
-    import boto3
     state.region = region
     state.sesv2 = boto3.client("sesv2", region_name=region)  # pyright: ignore[reportUnknownMemberType]
     state.iam = boto3.client("iam")  # pyright: ignore[reportUnknownMemberType]
@@ -80,8 +84,14 @@ def log_credentials() -> None:
     credentials = load_credentials()
     if not credentials:
         return
-    for domain, cred in sorted(credentials.items()):
-        logger.info("  %s: host=%s port=%s user=%s", domain, cred["host"], cred["port"], cred["username"])
+    rows = [(domain, cred["host"], str(cred["port"]), cred["username"]) for domain, cred in sorted(credentials.items())]
+    header = ("domain", "host", "port", "username")
+    widths = [max(len(row[i]) for row in [header, *rows]) for i in range(4)]
+    fmt = "\t".join(f"{{:<{w}}}" for w in widths)
+    logger.info("  %s", fmt.format(*header))
+    logger.info("  %s", "\t".join("-" * w for w in widths))
+    for row in rows:
+        logger.info("  %s", fmt.format(*row))
 
 
 # Resource makers
@@ -91,7 +101,6 @@ def make_identity(
     domain: str,
 ) -> None:
     """Build an SES identity node in the config tree."""
-    from provider import set_tree
     value: dict[str, str] = {"identity": domain}
 
     def push() -> None:
@@ -132,10 +141,6 @@ SMTP_SIGNING_VERSION: Final = b"\x04"
 
 def derive_smtp_password(secret_access_key: str, region: str) -> str:
     """Derive an SES SMTP password from an IAM secret access key using AWS's documented algorithm."""
-    import base64
-    import hashlib
-    import hmac
-
     def sign(key: bytes, message: str) -> bytes:
         return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
 
@@ -147,6 +152,70 @@ def derive_smtp_password(secret_access_key: str, region: str) -> str:
     return base64.b64encode(SMTP_SIGNING_VERSION + signature).decode("utf-8")
 
 
+def ignore_not_found(fn: Callable[[], None]) -> None:
+    """Call fn, ignoring IAM NoSuchEntity errors."""
+    try:
+        fn()
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchEntity":
+            return
+        raise
+
+
+def push_smtp_user(iam: object, username: str, domain: str, smtp_host: str, smtp_port: int) -> None:
+    """Create IAM user, attach SES policy, generate SMTP credentials."""
+    try:
+        iam.get_user(UserName=username)
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchEntity":
+            logger.info("    creating IAM user %s...", username)
+            iam.create_user(UserName=username)
+        else:
+            raise
+
+    iam.put_user_policy(
+        UserName=username,
+        PolicyName="ses-send",
+        PolicyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": ["ses:SendRawEmail"], "Resource": "*"}],
+        }),
+    )
+
+    existing_keys = iam.list_access_keys(UserName=username)
+    for key in existing_keys["AccessKeyMetadata"]:
+        iam.delete_access_key(UserName=username, AccessKeyId=key["AccessKeyId"])
+
+    access_key = iam.create_access_key(UserName=username)["AccessKey"]
+    smtp_password = derive_smtp_password(access_key["SecretAccessKey"], state.region)
+
+    save_credential(domain, {
+        "host": smtp_host,
+        "port": smtp_port,
+        "username": access_key["AccessKeyId"],
+        "password": smtp_password,
+    })
+    logger.info("    SMTP credentials saved for %s", domain)
+
+
+def remove_smtp_user(iam: object, username: str, domain: str) -> None:
+    """Delete IAM user, its keys, policy, and stored credentials."""
+    logger.info("    deleting SMTP user %s...", username)
+
+    try:
+        existing_keys = iam.list_access_keys(UserName=username)
+        for key in existing_keys["AccessKeyMetadata"]:
+            iam.delete_access_key(UserName=username, AccessKeyId=key["AccessKeyId"])
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "NoSuchEntity":
+            raise
+
+    ignore_not_found(lambda: iam.delete_user_policy(UserName=username, PolicyName="ses-send"))
+    ignore_not_found(lambda: iam.delete_user(UserName=username))
+
+    remove_credential(domain)
+
+
 def make_smtp_user(
     tree: ConfigTree,
     domain: str,
@@ -154,8 +223,6 @@ def make_smtp_user(
     remote_data: dict[str, object] | None = None,
 ) -> None:
     """Build an IAM SMTP user node in the config tree."""
-    from provider import set_tree
-
     iam = state.iam
     if iam is None:
         msg = "SES not initialized"
@@ -170,87 +237,16 @@ def make_smtp_user(
     else:
         value = {"username": username, "host": smtp_host, "port": smtp_port}
 
-    def push() -> None:
-        from botocore.exceptions import ClientError
-
-        # Create IAM user
-        try:
-            iam.get_user(UserName=username)
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchEntity":
-                logger.info("    creating IAM user %s...", username)
-                iam.create_user(UserName=username)
-            else:
-                raise
-
-        # Attach SES send policy
-        iam.put_user_policy(
-            UserName=username,
-            PolicyName="ses-send",
-            PolicyDocument=json.dumps({
-                "Version": "2012-10-17",
-                "Statement": [{
-                    "Effect": "Allow",
-                    "Action": ["ses:SendRawEmail"],
-                    "Resource": "*",
-                }],
-            }),
-        )
-
-        # Delete existing access keys before creating new one
-        existing_keys = iam.list_access_keys(UserName=username)
-        for key in existing_keys["AccessKeyMetadata"]:
-            iam.delete_access_key(UserName=username, AccessKeyId=key["AccessKeyId"])
-
-        # Create access key and derive SMTP password
-        access_key = iam.create_access_key(UserName=username)["AccessKey"]
-        smtp_password = derive_smtp_password(access_key["SecretAccessKey"], state.region)
-
-        save_credential(domain, {
-            "host": smtp_host,
-            "port": smtp_port,
-            "username": access_key["AccessKeyId"],
-            "password": smtp_password,
-        })
-        logger.info("    SMTP credentials saved for %s", domain)
-
-    def remove() -> None:
-        from botocore.exceptions import ClientError
-
-        logger.info("    deleting SMTP user %s...", username)
-
-        def ignore_not_found(fn: Callable[[], None]) -> None:
-            try:
-                fn()
-            except ClientError as e:
-                if e.response["Error"]["Code"] == "NoSuchEntity":
-                    return
-                raise
-
-        # Delete access keys
-        try:
-            existing_keys = iam.list_access_keys(UserName=username)
-            for key in existing_keys["AccessKeyMetadata"]:
-                iam.delete_access_key(UserName=username, AccessKeyId=key["AccessKeyId"])
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "NoSuchEntity":
-                raise
-
-        # Delete policy and user
-        ignore_not_found(lambda: iam.delete_user_policy(UserName=username, PolicyName="ses-send"))
-        ignore_not_found(lambda: iam.delete_user(UserName=username))
-
-        remove_credential(domain)
-
     path: Path = ("smtp_users", domain)
-    set_tree(tree, path, value, push, remove)
+    set_tree(tree, path, value,
+             lambda: push_smtp_user(iam, username, domain, smtp_host, smtp_port),
+             lambda: remove_smtp_user(iam, username, domain))
 
 
 # Fetch remote state
 
 def fetch_smtp_users(remote: ConfigTree, known_domains: set[str]) -> int:
     """Fetch existing IAM SMTP users into the remote tree. Returns count."""
-    from botocore.exceptions import ClientError
     iam = state.iam
     if iam is None:
         msg = "SES not initialized"

@@ -38,7 +38,7 @@ def set_tree(
     for key in path[:-1]:
         if key not in current:
             current[key] = {}
-        current = cast(ConfigTree, current[key])
+        current = cast("ConfigTree", current[key])
     leaf: LeafNode = {"value": value, "push": push_fn, "remove": remove_fn}
     current[path[-1]] = leaf
 
@@ -50,11 +50,11 @@ def is_leaf(node: ConfigTree | LeafNode) -> bool:
 
 def as_leaf(node: ConfigTree | LeafNode) -> LeafNode:
     """Narrow a node to LeafNode after checking is_leaf."""
-    return cast(LeafNode, node)
+    return cast("LeafNode", node)
 
 def as_tree(node: ConfigTree | LeafNode) -> ConfigTree:
     """Narrow a node to ConfigTree after checking it is not a leaf."""
-    return cast(ConfigTree, node)
+    return cast("ConfigTree", node)
 
 def diff_one_sided(
     source: ConfigTree,
@@ -145,8 +145,8 @@ def log_diffs(diffs: list[Diff], remote: ConfigTree) -> None:
             remote_node = get_node(remote, path)
             logger.info("update: %s", path_str)
             if remote_node:
-                remote_val = cast(dict[str, object], remote_node["value"])
-                local_val = cast(dict[str, object], node["value"])
+                remote_val = cast("dict[str, object]", remote_node["value"])
+                local_val = cast("dict[str, object]", node["value"])
                 for change in dict_delta(remote_val, local_val):
                     logger.info("%s", change)
         else:

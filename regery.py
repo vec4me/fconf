@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
+from typing import Final, Literal, TypedDict, cast
 
-if TYPE_CHECKING:
-    from provider import ConfigTree, Path
+import requests
+
+from provider import ConfigTree, Path, set_tree
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +21,14 @@ HttpMethod = Literal["get", "patch", "post"]
 
 class DomainNameservers(TypedDict, total=False):
     """Nameserver configuration from Regery API."""
+
     provider: str | None
     list: list[str]
 
 
 class DomainContacts(TypedDict, total=False):
     """Domain contacts configuration."""
+
     registrant: str
     admin: str
     tech: str
@@ -36,6 +39,7 @@ class DomainContacts(TypedDict, total=False):
 
 class Domain(TypedDict, total=False):
     """Domain from Regery API."""
+
     name: str
     autoRenew: bool
     nameservers: DomainNameservers
@@ -70,7 +74,6 @@ def perform(
     json: dict[str, object] | None = None,
 ) -> object:
     """Execute an HTTP request against the Regery API."""
-    import requests
     response = requests.request(
         method,
         f"https://api.regery.com/{url}",
@@ -95,7 +98,6 @@ def patch(url: str, data: dict[str, object]) -> object:
 
 def paginate(url: str) -> list[dict[str, object]]:
     """Fetch all domains from the Regery API with pagination."""
-    import requests
     results: list[dict[str, object]] = []
     offset = 0
     page = 0
@@ -130,7 +132,7 @@ def domain_value(domain: dict[str, object]) -> dict[str, object]:
     nameservers = domain["nameservers"]
     ns_list: list[str] = []
     if isinstance(nameservers, dict) and "list" in nameservers:
-        ns_list = sorted(cast(list[str], nameservers["list"]))
+        ns_list = sorted(cast("list[str]", nameservers["list"]))
     return {
         "autoRenew": domain["autoRenew"],
         "nameservers": ns_list,
@@ -164,7 +166,6 @@ def make_domain(
     remote_data: dict[str, object] | None = None,
 ) -> None:
     """Build a domain node in the config tree."""
-    from provider import set_tree
     if remote_data:
         name = str(remote_data["name"])
         value = domain_value(remote_data)

@@ -4,18 +4,35 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import Any, Final, Literal, TypedDict, cast
 
-import cloudflare as cf
+import cloudflare
 import provider
 import regery
 import ses
 import telnyx
-
-if TYPE_CHECKING:
-    from provider import ConfigTree
+from cloudflare import Zone
+from provider import ConfigTree
 
 logger = logging.getLogger(__name__)
+
+HostingType = Literal["worker", "page"] | None
+
+
+class ZoneConfig(TypedDict, total=False):
+    """Per-zone configuration options."""
+
+    address: str
+    ssl: str
+    sip_server: str
+    google_verification: str
+    mail_server: str
+    additional_records: list[tuple[str, str, str, bool]]
+    worker_domains: list[tuple[str, str]]
+    redirect_to: str
+    short_name: str
+    retro_index: bool
+    icloud_mail: bool
 
 # ============================================================
 # Cloudflare
@@ -31,7 +48,7 @@ CF_DKIM_RECORD: Final = (
     "bTixDSJwIDAQAB"
 )
 
-ZONE_CONFIG: Final[dict[str, dict[str, object]]] = {
+ZONE_CONFIG: Final[dict[str, ZoneConfig]] = {
     "hiroshimajobnavi.com": {
         "address": "34.111.141.225",
         "ssl": "full",
@@ -46,7 +63,10 @@ ZONE_CONFIG: Final[dict[str, dict[str, object]]] = {
     "clarkn.co.jp": {
         "google_verification": "ZsBDgLNcr70Rc7e6dF47J7pbLp435l1CF-hHyf6EaQM",
         "mail_server": "smtp.google.com",
-        "additional_records": [("uni", "A", "219.211.176.140", False)],
+        "additional_records": [
+            ("uni", "A", "219.211.176.140", False),
+            ("@", "TXT", "google-site-verification=ZH2D3QODde7h7X2yI299oREgSXmMcPbtKjtl122vmqg", False),
+        ],
         "worker_domains": [("clarkn-meet", "meet")],
     },
     "southtowntattoocollective.com": {
@@ -65,29 +85,29 @@ ZONE_CONFIG: Final[dict[str, dict[str, object]]] = {
 
 # Helpers
 
-def get_config(zone: dict[str, object], key: str) -> object:
+def get_config(zone: Zone, key: str) -> object:
     """Get a configuration value for a zone by key."""
     return ZONE_CONFIG.get(str(zone["name"]), {}).get(key)
 
 
-def is_brr_child(zone: dict[str, object]) -> bool:
+def is_brr_child(zone: Zone) -> bool:
     """Check whether a zone is a child of bestratereview.com."""
     return "rate" in str(zone["name"]) and zone["name"] != "bestratereview.com"
 
 
-def is_www_primary(zone: dict[str, object]) -> bool:
+def is_www_primary(zone: Zone) -> bool:
     """Check whether www is the primary hostname for a zone."""
     parts = str(zone["name"]).split(".")
     return not parts[0].isdigit() and parts[-1] in {"com", "net", "org", "jp"}
 
 
-def get_hostnames(zone: dict[str, object]) -> tuple[str, str]:
+def get_hostnames(zone: Zone) -> tuple[str, str]:
     """Return (primary, secondary) hostnames for a zone."""
     www, root = f"www.{zone['name']}", str(zone["name"])
     return (www, root) if is_www_primary(zone) else (root, www)
 
 
-def get_short_name(zone: dict[str, object]) -> str:
+def get_short_name(zone: Zone) -> str:
     """Return the short name for a zone, respecting settings."""
     override = get_config(zone, "short_name")
     if override is not None:
@@ -95,7 +115,7 @@ def get_short_name(zone: dict[str, object]) -> str:
     return str(zone["name"]).split(".")[0]
 
 
-def find_service(collection: dict[str, dict[str, object]], name: str, suffixes: list[str]) -> str | None:
+def find_service(collection: dict[str, object], name: str, suffixes: list[str]) -> str | None:
     """Find a service in a collection by trying name+suffix combinations."""
     for suffix in suffixes:
         key = f"{name}{suffix}"
@@ -104,26 +124,26 @@ def find_service(collection: dict[str, dict[str, object]], name: str, suffixes: 
     return None
 
 
-def find_worker(workers: dict[str, dict[str, object]], zone: dict[str, object]) -> str | None:
+def find_worker(workers: dict[str, object], zone: Zone) -> str | None:
     """Find the worker associated with a zone."""
     return find_service(workers, get_short_name(zone), ["", "-website"])
 
 
-def find_page(pages: dict[str, dict[str, object]], zone: dict[str, object]) -> str | None:
+def find_page(pages: dict[str, object], zone: Zone) -> str | None:
     """Find the page associated with a zone."""
     return find_service(pages, get_short_name(zone), ["", "-website"])
 
 
-def find_api_worker(workers: dict[str, dict[str, object]], zone: dict[str, object]) -> str | None:
+def find_api_worker(workers: dict[str, object], zone: Zone) -> str | None:
     """Find the API worker associated with a zone."""
     return find_service(workers, get_short_name(zone), ["-api", ""])
 
 
 def get_hosting_type(
-    workers: dict[str, dict[str, object]],
-    pages: dict[str, dict[str, object]],
-    zone: dict[str, object],
-) -> str | None:
+    workers: dict[str, object],
+    pages: dict[str, object],
+    zone: Zone,
+) -> HostingType:
     """Determine whether a zone is backed by a worker or a page."""
     if find_worker(workers, zone):
         return "worker"
@@ -136,7 +156,7 @@ def get_hosting_type(
 
 def configure_cf_email(
     local: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     forward_to: str,
     dkim_tokens: dict[str, list[str]] | None,
 ) -> None:
@@ -147,47 +167,47 @@ def configure_cf_email(
     spf_includes = "include:_spf.mx.cloudflare.net include:amazonses.com"
     if is_icloud:
         spf_includes += " include:icloud.com"
-    cf.make_record(local, zone, "@", "TXT", f"v=spf1 {spf_includes} ~all")
+    cloudflare.make_record(local, zone, "@", "TXT", f"v=spf1 {spf_includes} ~all")
 
     # Cloudflare Email Routing MX
-    cf.make_record(local, zone, "@", "MX", "route1.mx.cloudflare.net", priority=10)
-    cf.make_record(local, zone, "@", "MX", "route2.mx.cloudflare.net", priority=20)
-    cf.make_record(local, zone, "@", "MX", "route3.mx.cloudflare.net", priority=30)
+    cloudflare.make_record(local, zone, "@", "MX", "route1.mx.cloudflare.net", priority=10)
+    cloudflare.make_record(local, zone, "@", "MX", "route2.mx.cloudflare.net", priority=20)
+    cloudflare.make_record(local, zone, "@", "MX", "route3.mx.cloudflare.net", priority=30)
 
     # Cloudflare Email Routing DKIM
-    cf.make_record(local, zone, "cf2024-1._domainkey", "TXT", CF_DKIM_RECORD)
+    cloudflare.make_record(local, zone, "cf2024-1._domainkey", "TXT", CF_DKIM_RECORD)
 
     # SES outbound DKIM
     if dkim_tokens and name in dkim_tokens:
         for token in dkim_tokens[name]:
-            cf.make_record(
+            cloudflare.make_record(
                 local, zone, f"{token}._domainkey", "CNAME",
                 f"{token}.dkim.amazonses.com", proxied=False,
             )
 
     # iCloud DKIM
     if is_icloud:
-        cf.make_record(
+        cloudflare.make_record(
             local, zone, "sig1._domainkey", "CNAME",
             f"sig1.dkim.{name}.at.icloudmailadmin.com", proxied=False,
         )
 
-    cf.make_email_routing_catch_all(local, zone, forward_to=forward_to)
+    cloudflare.make_email_routing_catch_all(local, zone, forward_to=forward_to)
 
 
-def configure_google_email(local: ConfigTree, zone: dict[str, object]) -> None:
+def configure_google_email(local: ConfigTree, zone: Zone) -> None:
     """Configure Google-based email DNS records for a zone."""
     mail_server = get_config(zone, "mail_server")
     google_verification = get_config(zone, "google_verification")
     if google_verification is not None:
-        cf.make_record(local, zone, "@", "TXT", f"google-site-verification={google_verification}")
-    cf.make_record(local, zone, "@", "MX", str(mail_server), priority=1)
-    cf.make_record(local, zone, "@", "TXT", "v=spf1 include:_spf.google.com ~all")
+        cloudflare.make_record(local, zone, "@", "TXT", f"google-site-verification={google_verification}")
+    cloudflare.make_record(local, zone, "@", "MX", str(mail_server), priority=1)
+    cloudflare.make_record(local, zone, "@", "TXT", "v=spf1 include:_spf.google.com ~all")
 
 
 def configure_email(
     local: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     dkim_tokens: dict[str, list[str]] | None = None,
     forward_to: str | None = None,
 ) -> None:
@@ -207,10 +227,10 @@ def configure_email(
 
 def configure_dns(
     local: ConfigTree,
-    workers: dict[str, dict[str, object]],
-    zone: dict[str, object],
+    workers: dict[str, object],
+    zone: Zone,
     vps: str | None,
-    hosting_type: str | None,
+    hosting_type: HostingType,
 ) -> None:
     """Configure DNS records for a zone including A/CNAME, DMARC, mail, and API records."""
     address = get_config(zone, "address")
@@ -221,57 +241,57 @@ def configure_dns(
 
     if hosting_type == "page":
         pages_target = f"{get_short_name(zone)}.pages.dev"
-        cf.make_record(local, zone, primary_label, "CNAME", pages_target)
-        cf.make_record(local, zone, secondary_label, "CNAME", pages_target)
+        cloudflare.make_record(local, zone, primary_label, "CNAME", pages_target)
+        cloudflare.make_record(local, zone, secondary_label, "CNAME", pages_target)
     elif hosting_type == "worker":
         pass  # worker domains handle DNS records
     else:
-        cf.make_record(local, zone, primary_label, "A", str(address))
-        cf.make_record(local, zone, secondary_label, "A", str(address))
+        cloudflare.make_record(local, zone, primary_label, "A", str(address))
+        cloudflare.make_record(local, zone, secondary_label, "A", str(address))
 
-    cf.make_record(local, zone, "_dmarc", "TXT", "v=DMARC1; p=quarantine;")
+    cloudflare.make_record(local, zone, "_dmarc", "TXT", "v=DMARC1; p=quarantine;")
 
-    cf.make_record(local, zone, "mail", "CNAME", "mail.vec4me.workers.dev")
-    cf.make_route(local, zone, f"mail.{zone['name']}/unsubscribe*", "mail")
+    cloudflare.make_record(local, zone, "mail", "CNAME", "mail.vec4me.workers.dev")
+    cloudflare.make_route(local, zone, f"mail.{zone['name']}/unsubscribe*", "mail")
 
     api_worker = find_api_worker(workers, zone)
     if api_worker:
-        cf.make_record(local, zone, "api", "CNAME", f"{api_worker}.vec4me.workers.dev")
-        cf.make_route(local, zone, f"api.{zone['name']}/*", api_worker)
+        cloudflare.make_record(local, zone, "api", "CNAME", f"{api_worker}.vec4me.workers.dev")
+        cloudflare.make_route(local, zone, f"api.{zone['name']}/*", api_worker)
 
     configure_sip_records(local, zone)
     configure_additional_records(local, zone)
 
 
-def configure_sip_records(local: ConfigTree, zone: dict[str, object]) -> None:
+def configure_sip_records(local: ConfigTree, zone: Zone) -> None:
     """Configure SIP DNS records for a zone if applicable."""
     sip_server = get_config(zone, "sip_server")
     if sip_server:
-        cf.make_record(local, zone, "sip", "CNAME", str(sip_server), proxied=False)
-        cf.make_srv_record(local, zone, "_sip", "_udp", f"sip.{zone['name']}", port=5060)
+        cloudflare.make_record(local, zone, "sip", "CNAME", str(sip_server), proxied=False)
+        cloudflare.make_srv_record(local, zone, "_sip", "_udp", f"sip.{zone['name']}", port=5060)
 
 
-def configure_additional_records(local: ConfigTree, zone: dict[str, object]) -> None:
+def configure_additional_records(local: ConfigTree, zone: Zone) -> None:
     """Configure any additional DNS records specified in zone config."""
     additional_records = get_config(zone, "additional_records")
     if additional_records:
-        records = cast(list[tuple[str, str, str, bool]], additional_records)
+        records = cast("list[tuple[str, str, str, bool]]", additional_records)
         for name, record_type, content, proxied in records:
-            cf.make_record(local, zone, name, record_type, content, proxied=proxied)
+            cloudflare.make_record(local, zone, name, record_type, content, proxied=proxied)
 
 
 # Redirects
 
-def configure_redirects(local: ConfigTree, zone: dict[str, object]) -> None:
+def configure_redirects(local: ConfigTree, zone: Zone) -> None:
     """Configure redirect rules for a zone."""
     primary, secondary = get_hostnames(zone)
 
-    cf.make_redirect_rule(
+    cloudflare.make_redirect_rule(
         local, zone,
         f'(http.host eq "{secondary}")',
         f'concat("https://{primary}", http.request.uri.path)',
     )
-    cf.make_redirect_rule(
+    cloudflare.make_redirect_rule(
         local, zone,
         f'(http.host eq "{primary}" and starts_with(http.request.uri.path, "/fbclid"))',
         f'concat("https://{primary}/", "")',
@@ -282,34 +302,34 @@ def configure_redirects(local: ConfigTree, zone: dict[str, object]) -> None:
 
 def configure_special_redirects(
     local: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     primary: str,
 ) -> None:
     """Configure special redirect rules (retro index, redirect_to, BRR child)."""
     if get_config(zone, "retro_index") is not None:
-        cf.make_redirect_rule(
+        cloudflare.make_redirect_rule(
             local, zone,
             f'(http.host eq "{primary}" and http.request.uri.path eq "/")',
             f'concat("https://{primary}/index.htm", "")',
         )
     elif (redirect_to := get_config(zone, "redirect_to")) is not None:
-        cf.make_redirect_rule(
+        cloudflare.make_redirect_rule(
             local, zone,
             f'(http.host eq "www.{zone["name"]}")',
             f'concat("https://www.{redirect_to}", http.request.uri.path)',
         )
-        cf.make_redirect_rule(
+        cloudflare.make_redirect_rule(
             local, zone,
             f'(http.host eq "{zone["name"]}")',
             f'concat("https://{redirect_to}", http.request.uri.path)',
         )
     elif is_brr_child(zone):
-        cf.make_redirect_rule(
+        cloudflare.make_redirect_rule(
             local, zone,
             f'(http.host eq "www.{zone["name"]}")',
             'concat("https://www.bestratereview.com", http.request.uri.path)',
         )
-        cf.make_redirect_rule(
+        cloudflare.make_redirect_rule(
             local, zone,
             f'(http.host eq "{zone["name"]}")',
             'concat("https://bestratereview.com", http.request.uri.path)',
@@ -322,20 +342,20 @@ def configure_special_redirects(
 
 def configure_domains(
     local: ConfigTree,
-    workers: dict[str, dict[str, object]],
-    pages: dict[str, dict[str, object]],
-    zone: dict[str, object],
+    workers: dict[str, object],
+    pages: dict[str, object],
+    zone: Zone,
     used_services: set[str],
-    hosting_type: str | None,
+    hosting_type: HostingType,
 ) -> None:
     """Configure worker and page custom domains for a zone."""
     primary, secondary = get_hostnames(zone)
 
     worker_domains = get_config(zone, "worker_domains")
     if worker_domains:
-        domains = cast(list[tuple[str, str]], worker_domains)
+        domains = cast("list[tuple[str, str]]", worker_domains)
         for worker_name, subdomain in domains:
-            cf.make_worker_domain(local, worker_name, zone, f"{subdomain}.{zone['name']}")
+            cloudflare.make_worker_domain(local, worker_name, zone, f"{subdomain}.{zone['name']}")
             used_services.add(worker_name)
 
     api_worker = find_api_worker(workers, zone)
@@ -346,48 +366,48 @@ def configure_domains(
     if worker:
         used_services.add(worker)
     if hosting_type == "worker" and worker:
-        cf.make_worker_domain(local, worker, zone, primary)
-        cf.make_worker_domain(local, worker, zone, secondary)
+        cloudflare.make_worker_domain(local, worker, zone, primary)
+        cloudflare.make_worker_domain(local, worker, zone, secondary)
 
     page = find_page(pages, zone)
     if page:
         used_services.add(page)
     if hosting_type == "page" and page:
-        cf.make_page_domain(local, page, primary)
-        cf.make_page_domain(local, page, secondary)
+        cloudflare.make_page_domain(local, page, primary)
+        cloudflare.make_page_domain(local, page, secondary)
 
 
 # Settings
 
 def configure_settings(
     local: ConfigTree,
-    zone: dict[str, object],
+    zone: Zone,
     settings: dict[str, object],
 ) -> None:
     """Configure zone settings from settings, respecting per-zone config."""
-    zone_settings = cast(dict[str, dict[str, Any]], zone["settings"])
+    zone_settings = cast("dict[str, dict[str, Any]]", zone["settings"])
     for setting_id, setting in zone_settings.items():
         if setting["editable"] and setting_id in settings:
             value = settings[setting_id]
             zone_override = get_config(zone, setting_id)
             if zone_override is not None:
                 value = zone_override
-            cf.make_setting(local, zone, setting_id, value)
+            cloudflare.make_setting(local, zone, setting_id, value)
     if zone["dnssec"]:
-        cf.make_dnssec(local, zone, "disabled")
+        cloudflare.make_dnssec(local, zone, "disabled")
 
 
 # Regery
 
 def configure_regery(
     local: ConfigTree,
-    zones: dict[str, dict[str, object]],
+    zones: dict[str, Zone],
     contact_id: str,
 ) -> None:
     """Configure Regery domains to use Cloudflare nameservers with auto-renew."""
     for zone in zones.values():
         name = str(zone["name"])
-        nameservers = cast(list[str], zone.get("name_servers", []))
+        nameservers = cast("list[str]", zone.get("name_servers", []))
         regery.make_domain(
             local,
             name=name,
@@ -505,13 +525,13 @@ def run_cloudflare(
     vps: str | None,
     dkim_tokens: dict[str, list[str]],
     email_routing_domains: dict[str, str],
-    zone_list: list[dict[str, object]] | None = None,
-) -> dict[str, dict[str, object]]:
+    zone_list: list[Zone] | None = None,
+) -> dict[str, Zone]:
     """Run the Cloudflare declarative configuration. Returns zones dict."""
     logger.info("\n=== Cloudflare ===")
     used_services: set[str] = set()
 
-    remote, zones, workers, pages = cf.fetch_all(setting_ids=set(settings.keys()), zone_list=zone_list)
+    remote, zones, workers, pages = cloudflare.fetch_all(setting_ids=set(settings.keys()), zone_list=zone_list)
 
     local: ConfigTree = {}
     for zone in zones.values():
@@ -562,12 +582,12 @@ def main() -> None:
     }
     email_default_forward = "vec4me@icloud.com"
 
-    cf.init()
+    cloudflare.init()
     telnyx.init()
     regery.init()
 
     google_domains = {name for name, config in ZONE_CONFIG.items() if "mail_server" in config}
-    zone_list = cf.paginate("zones")
+    zone_list = cloudflare.paginate("zones")
     email_routing_domains: dict[str, str] = {}
     for zone in zone_list:
         name = str(zone["name"])
@@ -577,7 +597,7 @@ def main() -> None:
     ses_remote, dkim_tokens = run_ses_fetch(aws_region)
     ses_domains = list(email_routing_domains.keys())
 
-    cf.ensure_destination_addresses(set(email_routing_domains.values()))
+    cloudflare.ensure_destination_addresses(set(email_routing_domains.values()))
     zones = run_cloudflare(DEFAULT_SETTINGS, vps, dkim_tokens, email_routing_domains, zone_list=zone_list)
     run_ses_apply(ses_remote, ses_domains)
 
