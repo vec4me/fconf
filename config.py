@@ -579,6 +579,7 @@ def main() -> None:
         "tattoocollectivereno.com": "tattoocollectivereno@gmail.com",
         "southtowntattoocollective.com": "tattoocollectivereno@gmail.com",
         "hiroshimajobnavi.com": "info@clarkn.co.jp",
+        "valgrid.co": "valgrid0011@gmail.com",
     }
     email_default_forward = "vec4me@icloud.com"
 
