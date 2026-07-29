@@ -159,6 +159,7 @@ def configure_cf_email(
     zone: Zone,
     forward_to: str,
     dkim_tokens: dict[str, list[str]] | None,
+    mx_priorities: dict[str, int],
 ) -> None:
     """Configure Cloudflare Email Routing and SES outbound DNS for a zone."""
     name = str(zone["name"])
@@ -170,9 +171,19 @@ def configure_cf_email(
     cloudflare.make_record(local, zone, "@", "TXT", f"v=spf1 {spf_includes} ~all")
 
     # Cloudflare Email Routing MX
-    cloudflare.make_record(local, zone, "@", "MX", "route1.mx.cloudflare.net", priority=10)
-    cloudflare.make_record(local, zone, "@", "MX", "route2.mx.cloudflare.net", priority=20)
-    cloudflare.make_record(local, zone, "@", "MX", "route3.mx.cloudflare.net", priority=30)
+    for mail_server in (
+        "route1.mx.cloudflare.net",
+        "route2.mx.cloudflare.net",
+        "route3.mx.cloudflare.net",
+    ):
+        cloudflare.make_record(
+            local,
+            zone,
+            "@",
+            "MX",
+            mail_server,
+            priority=mx_priorities[mail_server],
+        )
 
     # Cloudflare Email Routing DKIM
     cloudflare.make_record(local, zone, "cf2024-1._domainkey", "TXT", CF_DKIM_RECORD)
@@ -210,6 +221,7 @@ def configure_email(
     zone: Zone,
     dkim_tokens: dict[str, list[str]] | None = None,
     forward_to: str | None = None,
+    mx_priorities: dict[str, int] | None = None,
 ) -> None:
     """Configure email DNS records for a zone based on its email provider."""
     mail_server = get_config(zone, "mail_server")
@@ -220,7 +232,10 @@ def configure_email(
     if forward_to is None:
         msg = f"forward_to must be set for email routing domain {zone['name']}"
         raise ValueError(msg)
-    configure_cf_email(local, zone, forward_to, dkim_tokens)
+    if mx_priorities is None:
+        msg = f"MX priorities must be set for email routing domain {zone['name']}"
+        raise ValueError(msg)
+    configure_cf_email(local, zone, forward_to, dkim_tokens, mx_priorities)
 
 
 # DNS
@@ -537,7 +552,12 @@ def run_cloudflare(
     for zone in zones.values():
         hosting_type = get_hosting_type(workers, pages, zone)
         forward_to = email_routing_domains.get(str(zone["name"]))
-        configure_email(local, zone, dkim_tokens, forward_to)
+        mx_priorities = (
+            cloudflare.get_email_routing_mx_priorities(zone)
+            if forward_to is not None
+            else None
+        )
+        configure_email(local, zone, dkim_tokens, forward_to, mx_priorities)
         configure_dns(local, workers, zone, vps, hosting_type)
         configure_redirects(local, zone)
         configure_domains(local, workers, pages, zone, used_services, hosting_type)

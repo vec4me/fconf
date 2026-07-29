@@ -710,6 +710,44 @@ def ensure_destination_addresses(forward_addresses: set[str]) -> None:
 
 
 # Fetchers
+def get_email_routing_mx_priorities(zone: Zone) -> dict[str, int]:
+    """Return Cloudflare's recommended Email Routing MX priorities for a zone."""
+    zone_id = str(zone["id"])
+    zone_name = str(zone["name"])
+    result = get(f"zones/{zone_id}/email/routing/dns")
+
+    raw_records: object
+    if isinstance(result, list):
+        raw_records = result
+    elif isinstance(result, dict):
+        raw_records = result.get("record", [])
+    else:
+        raw_records = []
+
+    priorities: dict[str, int] = {}
+    if isinstance(raw_records, list):
+        for raw_record in raw_records:
+            if not isinstance(raw_record, dict) or raw_record.get("type") != "MX":
+                continue
+            content = str(raw_record.get("content", "")).rstrip(".").lower()
+            priority = raw_record.get("priority")
+            if content.startswith("route") and content.endswith(".mx.cloudflare.net"):
+                if isinstance(priority, (int, float)):
+                    priorities[content] = int(priority)
+
+    expected = {f"route{index}.mx.cloudflare.net" for index in range(1, 4)}
+    missing = expected - priorities.keys()
+    if missing:
+        missing_names = ", ".join(sorted(missing))
+        msg = (
+            f"Cloudflare did not return Email Routing MX priorities for "
+            f"{zone_name}: {missing_names}"
+        )
+        raise RuntimeError(msg)
+
+    return priorities
+
+
 def paginate(url: str) -> list[dict[str, object]]:
     """Fetch all pages from a paginated Cloudflare API endpoint."""
     results: list[dict[str, object]] = []
