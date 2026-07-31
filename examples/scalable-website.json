@@ -1,0 +1,16 @@
+{
+  "workers": {
+    "domains": {
+      "app.example.org": { "hostname": "app.example.org", "service": "application" }
+    }
+  },
+  "zones": {
+    "example.org": {
+        "workers": {
+          "routes": {
+            "api": { "pattern": "api.example.org/*", "script": "application" }
+          }
+        }
+      }
+  }
+}

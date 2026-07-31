@@ -1,0 +1,74 @@
+#if 0
+error() {
+    echo "$*" >&2
+    exit 1
+}
+
+sh tools/build-lib.sh || error "could not build Functional Configurator library"
+mkdir -p build || error "could not create build directory"
+clang \
+    -fprebuilt-module-path=build \
+    -std=c++20 \
+    -g \
+    -Os \
+    -x c++ \
+    -c "$0" \
+    -o build/telnyx-test.o || error "could not build Telnyx test"
+clang \
+    -fprebuilt-module-path=build \
+    -std=c++20 \
+    -g \
+    -Os \
+    build/telnyx-test.o \
+    build/telnyx.o \
+    build/http.o \
+    build/resources.o \
+    -lyyjson \
+    -lcurl \
+    -o build/telnyx-test || error "could not link Telnyx test"
+build/telnyx-test || error "Telnyx test failed"
+exit 0
+#endif
+
+import resources;
+import telnyx;
+
+#include <stdio.h>
+#include <string.h>
+#include <yyjson.h>
+
+int main(void) {
+    resources::set desired;
+    yyjson_doc *manifest_document;
+    int success;
+
+    manifest_document = yyjson_read(
+        "{\"messaging_profiles\":{\"main\":{\"name\":\"main\"}},"
+        "\"outbound_voice_profiles\":{\"main\":{\"name\":\"main\"}},"
+        "\"credential_connections\":{\"main\":{\"connection_name\":\"main\"}},"
+        "\"phone_numbers\":[{\"phone_number\":\"+12025550123\",\"voice\":{\"connection_id\":\"${telnyx.credential_connections.main.id}\"}}],"
+        "\"messaging_phone_numbers\":[{\"phone_number\":\"+12025550123\",\"messaging_profile_id\":\"${telnyx.messaging_profiles.main.id}\"}]}",
+        strlen(
+            "{\"messaging_profiles\":{\"main\":{\"name\":\"main\"}},"
+            "\"outbound_voice_profiles\":{\"main\":{\"name\":\"main\"}},"
+            "\"credential_connections\":{\"main\":{\"connection_name\":\"main\"}},"
+            "\"phone_numbers\":[{\"phone_number\":\"+12025550123\",\"voice\":{\"connection_id\":\"${telnyx.credential_connections.main.id}\"}}],"
+            "\"messaging_phone_numbers\":[{\"phone_number\":\"+12025550123\",\"messaging_profile_id\":\"${telnyx.messaging_profiles.main.id}\"}]}"),
+        0);
+    resources::init(&desired);
+    success = manifest_document && telnyx::add_declared(&desired, yyjson_doc_get_root(manifest_document)) && desired.count == 6 &&
+              strcmp(desired.items[0].path, "telnyx/messaging_profiles/main") == 0 &&
+              strcmp(desired.items[1].path, "telnyx/outbound_voice_profiles/main") == 0 &&
+              strcmp(desired.items[2].path, "telnyx/credential_connections/main") == 0 &&
+              strcmp(desired.items[3].path, "telnyx/phone_numbers/+12025550123") == 0 &&
+              strcmp(desired.items[4].path, "telnyx/phone_numbers/+12025550123/voice") == 0 &&
+              strcmp(desired.items[5].path, "telnyx/messaging_phone_numbers/+12025550123") == 0 &&
+              !yyjson_obj_get(desired.items[3].json, "voice");
+    resources::release(&desired);
+    yyjson_doc_free(manifest_document);
+    if (!success) {
+        return 1;
+    }
+    puts("Telnyx native resources reconstruct independently");
+    return 0;
+}

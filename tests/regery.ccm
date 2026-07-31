@@ -1,0 +1,61 @@
+#if 0
+error() {
+    echo "$*" >&2
+    exit 1
+}
+
+sh tools/build-lib.sh || error "could not build Functional Configurator library"
+mkdir -p build || error "could not create build directory"
+clang \
+    -fprebuilt-module-path=build \
+    -std=c++20 \
+    -g \
+    -Os \
+    -x c++ \
+    -c "$0" \
+    -o build/regery-test.o || error "could not build Regery test"
+clang \
+    -fprebuilt-module-path=build \
+    -std=c++20 \
+    -g \
+    -Os \
+    build/regery-test.o \
+    build/regery.o \
+    build/http.o \
+    build/resources.o \
+    -lyyjson \
+    -lcurl \
+    -o build/regery-test || error "could not link Regery test"
+build/regery-test || error "Regery test failed"
+exit 0
+#endif
+
+import regery;
+import resources;
+
+#include <stdio.h>
+#include <string.h>
+#include <yyjson.h>
+
+int main(void) {
+    resources::set desired;
+    yyjson_doc *manifest_document;
+    int success;
+
+    manifest_document = yyjson_read("{\"domains\":[{\"name\":\"declared.test\",\"autoRenew\":false,\"nameservers\":{\"provider\":null,\"list\":[\"ns.example\"]},"
+                                    "\"contacts\":{\"registrant\":\"r\",\"admin\":\"a\",\"tech\":\"t\",\"billing\":\"b\",\"services\":[],\"disclose\":true}}]}",
+                                    strlen("{\"domains\":[{\"name\":\"declared.test\",\"autoRenew\":false,\"nameservers\":{\"provider\":null,\"list\":[\"ns.example\"]},"
+                                           "\"contacts\":{\"registrant\":\"r\",\"admin\":\"a\",\"tech\":\"t\",\"billing\":\"b\",\"services\":[],\"disclose\":true}}]}"), 0);
+    resources::init(&desired);
+    success = manifest_document && regery::add_declared_domains(&desired, yyjson_doc_get_root(manifest_document)) && desired.count == 1 &&
+              strcmp(desired.items[0].path, "regery/domains/declared.test") == 0 &&
+              yyjson_is_true(yyjson_obj_get(yyjson_obj_get(desired.items[0].json, "contacts"), "disclose")) &&
+              yyjson_is_false(yyjson_obj_get(desired.items[0].json, "autoRenew"));
+    resources::release(&desired);
+    yyjson_doc_free(manifest_document);
+    if (!success) {
+        return 1;
+    }
+    puts("Regery domain reconstruction matches");
+    return 0;
+}

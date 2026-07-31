@@ -1,21 +1,51 @@
 # Functional Configurator
 
-Declarative infrastructure configuration for Cloudflare, AWS SES, and Telnyx.
+Functional Configurator makes cloud state match a declarative JSON document. Provider sections intentionally follow their APIs instead of exposing a second policy language.
 
-## Environment Variables
+## Usage
 
-| Variable | Required | Where to get it |
-|---|---|---|
-| `CLOUDFLARE_API_TOKEN` | Yes | [Cloudflare dashboard](https://dash.cloudflare.com/profile/api-tokens) > Create Token. Needs permissions for Zone (DNS, Settings), Account (Workers, Pages), and Zone Rulesets. |
-| `CLOUDFLARE_ACCOUNT_ID` | Yes | Cloudflare dashboard > any domain > Overview sidebar > Account ID. |
-| `AWS_ACCESS_KEY_ID` | Yes (if SES domains configured) | AWS IAM access key. Needs permissions for SES, S3, IAM, and Lambda. Can also be configured via `~/.aws/credentials`. |
-| `AWS_SECRET_ACCESS_KEY` | Yes (if SES domains configured) | AWS IAM secret key. Paired with `AWS_ACCESS_KEY_ID`. |
-| `AWS_REGION` | Yes (if SES domains configured) | The AWS region your SES is set up in, e.g. `us-east-1`. Must be a region where SES is available. |
-| `VPS` | No | IP address of your default VPS. Used as the A record for domains without a specific address configured. |
-| `TELNYX_API_KEY` | Yes | [Telnyx portal](https://portal.telnyx.com/) > API Keys. |
-| `SIP_PASSWORD` | No | Password for Telnyx SIP credential connections. Defaults to empty string. |
-| `REGERY_API_KEY` | Yes | [Regery dashboard](https://regery.com/) > API settings. |
-| `REGERY_API_SECRET` | Yes | [Regery dashboard](https://regery.com/) > API settings. Paired with `REGERY_API_KEY`. |
-| `REGERY_CONTACT_ID` | Yes | Contact ID for domain registration contacts (registrant, admin, tech, billing). |
+Build the CLI, then plan or apply the repository's JavaScript configuration:
 
-Run `python config.py`. The tool fetches current state from all providers, computes a diff against the desired configuration, and prompts before applying changes.
+```sh
+sh tools/build-cli.sh
+node config.js
+node config.js --wet-run
+```
+
+`config.js` contains one plain object per provider and passes each one independently to `fconf`. A dry run prints creates, updates, and removals; `--wet-run` applies them.
+
+The provider-scoped CLI is `fconf <provider> <configuration-file|-> [--wet-run]`. Cloudflare zones are keyed by their exact zone name. Resource collections within a zone are keyed only to give each desired resource stable identity; their values are request bodies shaped like the corresponding provider API.
+
+Cloudflare `workers` is keyed by script name. Each Worker contains a `script-settings` subresource whose value is a declared subset of that API's JSON body (`logpush`, `observability`, `tags`, or `tail_consumers`). An empty `script-settings` object verifies that the Worker exists without managing any settings. Worker source uploads are not inferred from this collection.
+
+Cloudflare hierarchy follows API ownership:
+
+```json
+{
+    "workers": { "script-name": { "script-settings": {} } },
+    "worker_domains": { "app.example.com": { "hostname": "app.example.com", "service": "script-name", "environment": "production" } },
+    "pages": { "projects": { "project-name": { "domains": { "app.example.com": { "name": "app.example.com" } } } } },
+    "zones": { "example.com": { "settings": {}, "dns_records": {}, "worker_routes": {}, "redirect_rules": {} } }
+}
+```
+
+Telnyx collections likewise use endpoint names: `messaging_profiles`, `outbound_voice_profiles`, `credential_connections`, and `phone_numbers`. A phone-number entry can contain the native `voice` and `messaging` subresource bodies plus `phone_number` for the base `PATCH /phone_numbers/{id}` body.
+
+See [examples](examples/) and [config.js](config.js) for complete documents.
+
+Telnyx request bodies may contain `$ref:collection/key` to refer to an object declared elsewhere in the Telnyx section and `$env:NAME` to read a secret at apply time.
+
+## Environment
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `TELNYX_API_KEY` when a `telnyx` section is present
+- `REGERY_API_KEY` and `REGERY_API_SECRET` when a `regery.domains` section is present
+
+Credentials come from environment variables and do not appear in desired-state objects.
+
+## Dependencies
+
+- libc
+- libcurl
+- libyyjson

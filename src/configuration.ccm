@@ -1,0 +1,82 @@
+module;
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <yyjson.h>
+
+export module configuration;
+
+namespace configuration {
+
+export typedef struct manifest {
+    yyjson_doc *document;
+    yyjson_val *root;
+} manifest;
+
+static void clear(manifest *configuration) {
+    yyjson_doc_free(configuration->document);
+    memset(configuration, 0, sizeof(*configuration));
+}
+
+static int parse(const char *text, size_t length, manifest *configuration) {
+    memset(configuration, 0, sizeof(*configuration));
+    configuration->document = yyjson_read(text, length, 0);
+    configuration->root = configuration->document ? yyjson_doc_get_root(configuration->document) : NULL;
+    if (!yyjson_is_obj(configuration->root)) {
+        clear(configuration);
+        return 0;
+    }
+    return 1;
+}
+
+export int load(const char *path, manifest *configuration) {
+    FILE *file;
+    char *data;
+    char *larger;
+    size_t capacity;
+    size_t length;
+    int character;
+    int success;
+
+    file = path[0] == '-' && path[1] == '\0' ? stdin : fopen(path, "rb");
+    if (!file) {
+        return 0;
+    }
+    capacity = 4096;
+    length = 0;
+    data = (char *)malloc(capacity + 1);
+    if (!data) {
+        if (file != stdin) fclose(file);
+        return 0;
+    }
+    while ((character = fgetc(file)) != EOF) {
+        if (length + 1 >= capacity) {
+            capacity *= 2;
+            larger = (char *)realloc(data, capacity + 1);
+            if (!larger) {
+                free(data);
+                if (file != stdin) fclose(file);
+                return 0;
+            }
+            data = larger;
+        }
+        data[length++] = (char)character;
+    }
+    if (ferror(file)) {
+        free(data);
+        if (file != stdin) fclose(file);
+        return 0;
+    }
+    if (file != stdin) fclose(file);
+    data[length] = '\0';
+    success = parse(data, length, configuration);
+    free(data);
+    return success;
+}
+
+export void release(manifest *configuration) {
+    clear(configuration);
+}
+
+}

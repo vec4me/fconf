@@ -1,0 +1,211 @@
+module;
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <yyjson.h>
+
+export module regery;
+
+import http;
+import resources;
+
+namespace regery {
+
+static const char *api_key;
+static const char *api_secret;
+static char last_error[512];
+
+export void init(const char *key, const char *secret) {
+    api_key = key;
+    api_secret = secret;
+}
+
+export int configure(void) {
+    const char *key;
+    const char *secret;
+
+    key = getenv("REGERY_API_KEY");
+    secret = getenv("REGERY_API_SECRET");
+    if (!key || !*key || !secret || !*secret) {
+        memcpy(last_error, "missing credentials", sizeof("missing credentials"));
+        return 0;
+    }
+    init(key, secret);
+    return 1;
+}
+
+export const char *error(void) {
+    return last_error;
+}
+
+static void fail(const char *message) {
+    size_t length;
+
+    length = strlen(message);
+    if (length >= sizeof(last_error)) {
+        length = sizeof(last_error) - 1;
+    }
+    memcpy(last_error, message, length);
+    last_error[length] = '\0';
+}
+
+static int request(const char *method, const char *path, const char *body, yyjson_doc **document, yyjson_val **result) {
+    const char *headers[2];
+    char authorization[2048];
+    char url[4096];
+    http::response response;
+    yyjson_doc *parsed;
+    long status;
+
+    *document = NULL;
+    *result = NULL;
+    last_error[0] = '\0';
+    if (!api_key || !api_secret || strlen(api_key) + strlen(api_secret) + sizeof("Authorization: :") > sizeof(authorization) || strlen(path) + sizeof("https://api.regery.com/") > sizeof(url)) {
+        fail("invalid Regery configuration");
+        return 0;
+    }
+    sprintf(authorization, "Authorization: %s:%s", api_key, api_secret);
+    sprintf(url, "https://api.regery.com/%s", path);
+    headers[0] = authorization;
+    headers[1] = "Content-Type: application/json";
+    if (!http::request(method, url, headers, 2, body, &response)) {
+        fail("HTTP request failed");
+        return 0;
+    }
+    status = response.status;
+    parsed = response.length ? yyjson_read(response.body, response.length, 0) : NULL;
+    http::release(&response);
+    if (status < 200 || status >= 300) {
+        fail("request rejected");
+        yyjson_doc_free(parsed);
+        return 0;
+    }
+    if (!parsed) {
+        fail("invalid JSON response");
+        return 0;
+    }
+    *document = parsed;
+    *result = yyjson_doc_get_root(parsed);
+    return 1;
+}
+
+static int add_domain(resources::set *collection, const resources::set *scope, const char *name, yyjson_val *domain) {
+    char path[4096];
+
+    if (!name || !yyjson_is_obj(domain) || strlen(name) + sizeof("regery/domains/") > sizeof(path)) {
+        return 0;
+    }
+    sprintf(path, "regery/domains/%s", name);
+    if (scope && !resources::contains_path(scope, path, resources::REGERY_DOMAIN)) {
+        return 1;
+    }
+    return resources::add_json_resource(collection, path, resources::REGERY_DOMAIN, name, domain);
+}
+
+export int fetch_domains(resources::set *remote, const resources::set *scope) {
+    char endpoint[256];
+    const char *name;
+    yyjson_doc *document;
+    yyjson_val *domain;
+    yyjson_val *domains;
+    yyjson_val *root;
+    size_t count;
+    size_t index;
+    size_t offset;
+    size_t page;
+    size_t total;
+
+    offset = 0;
+    page = 0;
+    total = 1;
+    while (offset < total && page < 100) {
+        sprintf(endpoint, "v1/domains?offset=%lu&limit=50", (unsigned long)offset);
+        if (!request("GET", endpoint, NULL, &document, &root)) {
+            return 0;
+        }
+        domains = yyjson_obj_get(root, "domains");
+        total = (size_t)yyjson_get_uint(yyjson_obj_get(root, "total"));
+        if (!yyjson_is_arr(domains)) {
+            yyjson_doc_free(document);
+            fail("invalid domains response");
+            return 0;
+        }
+        count = yyjson_arr_size(domains);
+        for (index = 0; index < count; ++index) {
+            domain = yyjson_arr_get(domains, index);
+            name = yyjson_get_str(yyjson_obj_get(domain, "name"));
+            if (!add_domain(remote, scope, name, domain)) {
+                yyjson_doc_free(document);
+                return 0;
+            }
+        }
+        yyjson_doc_free(document);
+        if (!count) {
+            break;
+        }
+        offset += count;
+        ++page;
+    }
+    return 1;
+}
+
+export int add_declared_domains(resources::set *desired, yyjson_val *manifest) {
+    const char *name;
+    yyjson_val *domain;
+    yyjson_val *domains;
+    size_t index;
+    size_t count;
+
+    if (!yyjson_is_obj(manifest)) {
+        return 1;
+    }
+    domains = yyjson_obj_get(manifest, "domains");
+    if (!yyjson_is_arr(domains)) {
+        return 0;
+    }
+    yyjson_arr_foreach(domains, index, count, domain) {
+        name = yyjson_get_str(yyjson_obj_get(domain, "name"));
+        if (!yyjson_is_obj(domain) || !name || !add_domain(desired, NULL, name, domain)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+export int add_declared(yyjson_val *declaration, resources::set *remote, resources::set *desired) {
+    return yyjson_is_arr(yyjson_obj_get(declaration, "domains")) && add_declared_domains(desired, declaration) && fetch_domains(remote, desired);
+}
+
+static int update_domain(const resources::resource *resource) {
+    const char *name;
+    char endpoint[4096];
+    char *body;
+    yyjson_doc *response_document;
+    yyjson_val *response;
+    int success;
+
+    name = resource->identifier;
+    if (!name || strlen(name) + sizeof("v1/domains/") > sizeof(endpoint)) {
+        return 0;
+    }
+    body = resource->json ? yyjson_val_write(resource->json, 0, NULL) : NULL;
+    if (!body) {
+        return 0;
+    }
+    sprintf(endpoint, "v1/domains/%s", name);
+    success = request("PATCH", endpoint, body, &response_document, &response);
+    free(body);
+    yyjson_doc_free(response_document);
+    return success;
+}
+
+export int apply(const resources::diff *diff) {
+    if (diff->action == resources::REMOVE) {
+        fail("domain removal is not supported");
+        return 0;
+    }
+    return diff->desired && update_domain(diff->desired);
+}
+
+}

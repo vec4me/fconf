@@ -1,0 +1,52 @@
+#if 0
+error() {
+    echo "$*" >&2
+    exit 1
+}
+
+sh tools/build-lib.sh || error "could not build Functional Configurator library"
+mkdir -p build || error "could not create build directory"
+clang \
+    -fprebuilt-module-path=build \
+    -std=c++20 \
+    -g \
+    -Os \
+    -x c++ \
+    -c "$0" \
+    -o build/configuration-test.o || error "could not build configuration test"
+clang \
+    -fprebuilt-module-path=build \
+    -std=c++20 \
+    -g \
+    -Os \
+    build/configuration-test.o \
+    build/configuration.o \
+    -lyyjson \
+    -o build/configuration-test || error "could not link configuration test"
+build/configuration-test || error "configuration test failed"
+exit 0
+#endif
+
+import configuration;
+
+#include <stdio.h>
+#include <string.h>
+#include <yyjson.h>
+
+int main(void) {
+    configuration::manifest declarative = {};
+    configuration::manifest provider_only = {};
+    int success;
+
+    success = configuration::load("tests/declarative.json", &declarative) &&
+              yyjson_is_obj(yyjson_obj_get(yyjson_obj_get(declarative.root, "zones"), "example.com")) &&
+              !yyjson_obj_get(yyjson_obj_get(declarative.root, "zones"), "unmanaged.test");
+    configuration::release(&declarative);
+    success = success && configuration::load("tests/provider-only.json", &provider_only) && yyjson_is_obj(yyjson_obj_get(provider_only.root, "phone_numbers"));
+    configuration::release(&provider_only);
+    if (!success) {
+        return 1;
+    }
+    puts("declarative configuration loads");
+    return 0;
+}

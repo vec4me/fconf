@@ -1,0 +1,220 @@
+module;
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <yyjson.h>
+
+export module fconf;
+
+import cloudflare;
+import configuration;
+import http;
+import regery;
+import resources;
+import telnyx;
+
+namespace fconf {
+
+export typedef struct reconciliation reconciliation;
+
+struct reconciliation {
+    configuration::manifest configuration;
+    cloudflare::zones zones;
+    resources::set desired;
+    resources::set remote;
+    resources::changes changes;
+    int provider;
+    int http_initialized;
+};
+
+enum {
+    PROVIDER_CLOUDFLARE,
+    PROVIDER_REGERY,
+    PROVIDER_TELNYX
+};
+
+static char last_error[256];
+
+static void fail(const char *message) {
+    size_t length;
+
+    length = strlen(message);
+    if (length >= sizeof(last_error)) {
+        length = sizeof(last_error) - 1;
+    }
+    memcpy(last_error, message, length);
+    last_error[length] = '\0';
+}
+
+static void provider_fail(const char *message, const char *detail) {
+    size_t message_length;
+    size_t detail_length;
+
+    fail(message);
+    if (!detail || !*detail) {
+        return;
+    }
+    message_length = strlen(last_error);
+    if (message_length + 3 > sizeof(last_error)) {
+        return;
+    }
+    detail_length = strlen(detail);
+    if (message_length + detail_length + 3 > sizeof(last_error)) {
+        detail_length = sizeof(last_error) - message_length - 3;
+    }
+    memcpy(last_error, message, message_length);
+    memcpy(last_error + message_length, ": ", 2);
+    memcpy(last_error + message_length + 2, detail, detail_length);
+    last_error[message_length + detail_length + 2] = '\0';
+}
+
+static void cloudflare_fail(const char *message) {
+    provider_fail(message, cloudflare::error());
+}
+
+export const char *error(void) {
+    return last_error;
+}
+
+export reconciliation *load(const char *provider, const char *path) {
+    reconciliation *result;
+
+    result = (reconciliation *)malloc(sizeof(*result));
+    if (!result) {
+        fail("out of memory");
+        return NULL;
+    }
+    memset(result, 0, sizeof(*result));
+    resources::init(&result->remote);
+    resources::init(&result->desired);
+    resources::init_changes(&result->changes);
+    if (strcmp(provider, "cloudflare") == 0) {
+        result->provider = PROVIDER_CLOUDFLARE;
+    } else if (strcmp(provider, "regery") == 0) {
+        result->provider = PROVIDER_REGERY;
+    } else if (strcmp(provider, "telnyx") == 0) {
+        result->provider = PROVIDER_TELNYX;
+    } else {
+        fail("unknown provider");
+        free(result);
+        return NULL;
+    }
+    if (!configuration::load(path, &result->configuration)) {
+        fail("invalid or incomplete configuration");
+        free(result);
+        return NULL;
+    }
+    return result;
+}
+
+static int fetch_cloudflare(reconciliation *value) {
+    if (!cloudflare::configure() || !cloudflare::add_declared(value->configuration.root, &value->zones, &value->remote, &value->desired)) {
+        cloudflare_fail("could not process declared Cloudflare configuration");
+        return 0;
+    }
+    return 1;
+}
+
+static int fetch_regery(reconciliation *value) {
+    if (!regery::configure() || !regery::add_declared(value->configuration.root, &value->remote, &value->desired)) {
+        provider_fail("could not process declared Regery configuration", regery::error());
+        return 0;
+    }
+    return 1;
+}
+
+static int fetch_telnyx(reconciliation *value) {
+    if (!telnyx::configure() || !telnyx::add_configuration(value->configuration.root, &value->remote, &value->desired)) {
+        provider_fail("could not process declared Telnyx configuration", telnyx::error());
+        return 0;
+    }
+    return 1;
+}
+
+export int plan(reconciliation *value) {
+    if (!http::init()) {
+        fail("could not initialize HTTP");
+        return 0;
+    }
+    value->http_initialized = 1;
+    if (value->provider == PROVIDER_REGERY && !fetch_regery(value)) {
+        return 0;
+    }
+    if (value->provider == PROVIDER_TELNYX && !fetch_telnyx(value)) {
+        return 0;
+    }
+    if (value->provider == PROVIDER_CLOUDFLARE && !fetch_cloudflare(value)) {
+        return 0;
+    }
+    if (!resources::calculate(&value->remote, &value->desired, &value->changes)) {
+        fail("could not calculate infrastructure changes");
+        return 0;
+    }
+    return 1;
+}
+
+export size_t change_count(const reconciliation *value) {
+    return value->changes.count;
+}
+
+export const char *change_action(const reconciliation *value, size_t index) {
+    if (index >= value->changes.count) {
+        return NULL;
+    }
+    return resources::action_name(value->changes.items[index].action);
+}
+
+export const char *change_path(const reconciliation *value, size_t index) {
+    if (index >= value->changes.count) {
+        return NULL;
+    }
+    return value->changes.items[index].remote ? value->changes.items[index].remote->path : value->changes.items[index].desired->path;
+}
+
+export int wet_run(reconciliation *value) {
+    const resources::resource *resource;
+    resources::type type;
+    size_t index;
+
+    for (index = 0; index < value->changes.count; ++index) {
+        resource = value->changes.items[index].desired ? value->changes.items[index].desired : value->changes.items[index].remote;
+        if (!resource) {
+            fail("change has no resource");
+            return 0;
+        }
+        type = resource->type;
+        if (type == resources::REGERY_DOMAIN) {
+            if (!regery::apply(&value->changes.items[index])) {
+                provider_fail("could not apply Regery change", regery::error());
+                return 0;
+            }
+        } else if (type == resources::TELNYX_PROFILE) {
+            if (!telnyx::apply(&value->changes.items[index])) {
+                provider_fail("could not apply Telnyx change", telnyx::error());
+                return 0;
+            }
+        } else if (!cloudflare::apply(&value->changes.items[index], &value->zones)) {
+            cloudflare_fail("could not apply Cloudflare change");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+export void release(reconciliation *value) {
+    if (!value) {
+        return;
+    }
+    cloudflare::release_zones(&value->zones);
+    resources::release(&value->remote);
+    resources::release(&value->desired);
+    resources::release_changes(&value->changes);
+    if (value->http_initialized) {
+        http::cleanup();
+    }
+    configuration::release(&value->configuration);
+    free(value);
+}
+
+}

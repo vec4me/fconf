@@ -1,0 +1,65 @@
+module;
+
+#include <stdio.h>
+#include <string.h>
+
+export module cli;
+
+import fconf;
+
+static void help(void) {
+    puts("usage: fconf <provider> <configuration-file|-> [--wet-run]");
+    puts("       fconf --help");
+}
+
+int main(int argc, char **argv) {
+    const char *configuration_path;
+    const char *provider;
+    fconf::reconciliation *reconciliation;
+    size_t count;
+    size_t index;
+    int wet_run;
+
+    if (argc == 2 && strcmp(argv[1], "--help") == 0) {
+        help();
+        return 0;
+    }
+    wet_run = 0;
+    configuration_path = NULL;
+    provider = NULL;
+    if (argc == 3) {
+        provider = argv[1];
+        configuration_path = argv[2];
+    } else if (argc == 4 && strcmp(argv[3], "--wet-run") == 0) {
+        wet_run = 1;
+        provider = argv[1];
+        configuration_path = argv[2];
+    } else {
+        help();
+        return 1;
+    }
+    reconciliation = fconf::load(provider, configuration_path);
+    if (!reconciliation) {
+        fprintf(stderr, "fconf: %s: %s\n", fconf::error(), configuration_path);
+        return 1;
+    }
+    if (!fconf::plan(reconciliation)) {
+        fprintf(stderr, "fconf: %s\n", fconf::error());
+        fconf::release(reconciliation);
+        return 1;
+    }
+    count = fconf::change_count(reconciliation);
+    if (!count) {
+        puts("no changes");
+    }
+    for (index = 0; index < count; ++index) {
+        printf("%s: %s\n", fconf::change_action(reconciliation, index), fconf::change_path(reconciliation, index));
+    }
+    if (wet_run && count && !fconf::wet_run(reconciliation)) {
+        fprintf(stderr, "fconf: %s\n", fconf::error());
+        fconf::release(reconciliation);
+        return 1;
+    }
+    fconf::release(reconciliation);
+    return 0;
+}

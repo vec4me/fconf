@@ -1,0 +1,727 @@
+module;
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <yyjson.h>
+
+export module telnyx;
+
+import http;
+import resources;
+
+namespace telnyx {
+
+static const char *api_key;
+static char last_error[512];
+
+typedef struct reference {
+    char *path;
+    char *identifier;
+} reference;
+
+static reference *references;
+static size_t reference_count;
+
+static char *copy_text(const char *text) {
+    char *result;
+    size_t length;
+
+    length = strlen(text);
+    result = (char *)malloc(length + 1);
+    if (result) {
+        memcpy(result, text, length + 1);
+    }
+    return result;
+}
+
+static void clear_references(void) {
+    size_t index;
+
+    for (index = 0; index < reference_count; ++index) {
+        free(references[index].path);
+        free(references[index].identifier);
+    }
+    free(references);
+    references = NULL;
+    reference_count = 0;
+}
+
+export void init(const char *key) { api_key = key; }
+
+export int configure(void) {
+    const char *key;
+
+    key = getenv("TELNYX_API_KEY");
+    if (!key || !*key) {
+        memcpy(last_error, "missing credentials", sizeof("missing credentials"));
+        return 0;
+    }
+    init(key);
+    return 1;
+}
+
+static int save_reference(const char *path, const char *identifier) {
+    reference *items;
+    size_t index;
+
+    for (index = 0; index < reference_count; ++index) {
+        if (strcmp(references[index].path, path) == 0) {
+            return 1;
+        }
+    }
+    items = (reference *)realloc(references, (reference_count + 1) * sizeof(*references));
+    if (!items) {
+        return 0;
+    }
+    references = items;
+    references[reference_count].path = copy_text(path);
+    references[reference_count].identifier = copy_text(identifier);
+    if (!references[reference_count].path || !references[reference_count].identifier) {
+        free(references[reference_count].path);
+        free(references[reference_count].identifier);
+        return 0;
+    }
+    ++reference_count;
+    return 1;
+}
+
+static const char *reference_identifier(const char *expression) {
+    char path[4096];
+    size_t index;
+    size_t length;
+
+    length = strlen(expression);
+    if (length < sizeof("telnyx..id") || strncmp(expression, "telnyx.", 7) != 0 ||
+        strcmp(expression + length - 3, ".id") != 0 || length - 3 >= sizeof(path)) {
+        return NULL;
+    }
+    memcpy(path, expression, length - 3);
+    path[length - 3] = '\0';
+    for (index = 0; path[index]; ++index) {
+        if (path[index] == '.') {
+            path[index] = '/';
+        }
+    }
+    for (index = 0; index < reference_count; ++index) {
+        if (strcmp(references[index].path, path) == 0) {
+            return references[index].identifier;
+        }
+    }
+    return NULL;
+}
+
+export const char *error(void) { return last_error; }
+
+static void fail(const char *message) {
+    size_t length;
+
+    length = strlen(message);
+    if (length >= sizeof(last_error)) {
+        length = sizeof(last_error) - 1;
+    }
+    memcpy(last_error, message, length);
+    last_error[length] = '\0';
+}
+
+static const char *response_error(yyjson_val *root) {
+    yyjson_val *errors;
+    yyjson_val *first;
+    const char *detail;
+
+    errors = yyjson_obj_get(root, "errors");
+    first = yyjson_arr_get_first(errors);
+    detail = yyjson_get_str(yyjson_obj_get(first, "detail"));
+    return detail;
+}
+
+static int request(const char *method, const char *endpoint, const char *body, yyjson_doc **document, yyjson_val **data) {
+    const char *headers[2];
+    char authorization[2048];
+    char url[4096];
+    const char *detail;
+    http::response response;
+    yyjson_doc *parsed;
+    yyjson_val *root;
+    long status;
+
+    *document = NULL;
+    *data = NULL;
+    last_error[0] = '\0';
+    if (!api_key || strlen(api_key) + sizeof("Authorization: Bearer ") > sizeof(authorization) || strlen(endpoint) + sizeof("https://api.telnyx.com/v2/") > sizeof(url)) {
+        fail("invalid Telnyx configuration");
+        return 0;
+    }
+    sprintf(authorization, "Authorization: Bearer %s", api_key);
+    sprintf(url, "https://api.telnyx.com/v2/%s", endpoint);
+    headers[0] = authorization;
+    headers[1] = "Content-Type: application/json";
+    if (!http::request(method, url, headers, 2, body, &response)) {
+        fail("HTTP request failed");
+        return 0;
+    }
+    status = response.status;
+    if (status >= 200 && status < 300 && !response.length) {
+        http::release(&response);
+        return 1;
+    }
+    parsed = yyjson_read(response.body, response.length, 0);
+    http::release(&response);
+    if (!parsed) {
+        fail("invalid JSON response");
+        return 0;
+    }
+    root = yyjson_doc_get_root(parsed);
+    if (status < 200 || status >= 300) {
+        detail = response_error(root);
+        fail(detail ? detail : "request rejected");
+        yyjson_doc_free(parsed);
+        return 0;
+    }
+    *document = parsed;
+    *data = yyjson_obj_get(root, "data");
+    return 1;
+}
+
+static int fetch_list(const char *endpoint, yyjson_mut_doc *result_document, yyjson_mut_val *result) {
+    char path[512];
+    yyjson_doc *document;
+    yyjson_mut_val *copy;
+    yyjson_val *data;
+    yyjson_val *item;
+    yyjson_val *meta;
+    yyjson_val *root;
+    yyjson_val *total_pages;
+    size_t count;
+    size_t index;
+    size_t page;
+    size_t pages;
+
+    page = 1;
+    pages = 1;
+    while (page <= pages && page < 100) {
+        if (strlen(endpoint) + sizeof("?page[number]=18446744073709551615&page[size]=100") > sizeof(path)) {
+            return 0;
+        }
+        sprintf(path, "%s?page[number]=%lu&page[size]=100", endpoint, (unsigned long)page);
+        if (!request("GET", path, NULL, &document, &data) || !yyjson_is_arr(data)) {
+            return 0;
+        }
+        count = yyjson_arr_size(data);
+        for (index = 0; index < count; ++index) {
+            item = yyjson_arr_get(data, index);
+            copy = yyjson_val_mut_copy(result_document, item);
+            if (!copy || !yyjson_mut_arr_add_val(result, copy)) {
+                yyjson_doc_free(document);
+                return 0;
+            }
+        }
+        root = yyjson_doc_get_root(document);
+        meta = yyjson_obj_get(root, "meta");
+        total_pages = yyjson_obj_get(meta, "total_pages");
+        pages = yyjson_is_uint(total_pages) ? (size_t)yyjson_get_uint(total_pages) : page;
+        yyjson_doc_free(document);
+        ++page;
+    }
+    return 1;
+}
+
+
+static int add_scoped(resources::set *collection, const resources::set *scope, const char *path, const char *identifier, yyjson_val *value) {
+    if (scope && !resources::contains_path(scope, path, resources::TELNYX_PROFILE)) {
+        return 1;
+    }
+    return resources::add_json_resource(collection, path, resources::TELNYX_PROFILE, identifier, value);
+}
+
+static int resource_path(char *path, size_t capacity, const char *collection, const char *identity) {
+    if (!identity || strlen(collection) + strlen(identity) + sizeof("telnyx//") > capacity) {
+        return 0;
+    }
+    sprintf(path, "telnyx/%s/%s", collection, identity);
+    return 1;
+}
+
+static int add_collection(resources::set *desired, yyjson_val *manifest, const char *collection) {
+    const char *identity;
+    char path[4096];
+    yyjson_val *items;
+    yyjson_val *item;
+    yyjson_val *key;
+    size_t index;
+    size_t count;
+
+    items = yyjson_obj_get(manifest, collection);
+    if (!yyjson_is_obj(items)) {
+        return 0;
+    }
+    yyjson_obj_foreach(items, index, count, key, item) {
+        identity = yyjson_get_str(key);
+        if (!yyjson_is_obj(item) || !resource_path(path, sizeof(path), collection, identity) ||
+            !add_scoped(desired, NULL, path, NULL, item)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int add_array_collection(resources::set *desired, yyjson_val *manifest, const char *collection, const char *identity_field) {
+    const char *identity;
+    char path[4096];
+    yyjson_val *items;
+    yyjson_val *item;
+    size_t index;
+    size_t count;
+
+    items = yyjson_obj_get(manifest, collection);
+    if (!yyjson_is_arr(items)) {
+        return 0;
+    }
+    yyjson_arr_foreach(items, index, count, item) {
+        identity = yyjson_get_str(yyjson_obj_get(item, identity_field));
+        if (!yyjson_is_obj(item) || !resource_path(path, sizeof(path), collection, identity) ||
+            !add_scoped(desired, NULL, path, NULL, item)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int add_without(resources::set *desired, const char *path, yyjson_val *value, const char *excluded) {
+    yyjson_doc *copy_document;
+    yyjson_mut_doc *document;
+    yyjson_mut_val *body;
+    yyjson_mut_val *copy;
+    yyjson_val *key;
+    yyjson_val *field;
+    size_t index;
+    size_t count;
+    int success;
+
+    document = yyjson_mut_doc_new(NULL);
+    body = document ? yyjson_mut_obj(document) : NULL;
+    yyjson_obj_foreach(value, index, count, key, field) {
+        if (yyjson_equals_str(key, excluded)) {
+            continue;
+        }
+        copy = yyjson_val_mut_copy(document, field);
+        if (!body || !copy || !yyjson_mut_obj_add_val(document, body, yyjson_get_str(key), copy)) {
+            yyjson_mut_doc_free(document);
+            return 0;
+        }
+    }
+    copy_document = body ? yyjson_mut_val_imut_copy(body, NULL) : NULL;
+    success = copy_document && add_scoped(desired, NULL, path, NULL, yyjson_doc_get_root(copy_document));
+    yyjson_doc_free(copy_document);
+    yyjson_mut_doc_free(document);
+    return success;
+}
+
+static int add_declared_phones(resources::set *desired, yyjson_val *manifest) {
+    const char *number;
+    char path[4096];
+    yyjson_val *item;
+    yyjson_val *items;
+    yyjson_val *voice;
+    size_t index;
+    size_t count;
+
+    items = yyjson_obj_get(manifest, "phone_numbers");
+    if (!yyjson_is_arr(items)) {
+        return 0;
+    }
+    yyjson_arr_foreach(items, index, count, item) {
+        number = yyjson_get_str(yyjson_obj_get(item, "phone_number"));
+        if (!yyjson_is_obj(item) || !resource_path(path, sizeof(path), "phone_numbers", number) ||
+            !add_without(desired, path, item, "voice")) {
+            return 0;
+        }
+        voice = yyjson_obj_get(item, "voice");
+        if (voice) {
+            if (!yyjson_is_obj(voice) || strlen(path) + sizeof("/voice") > sizeof(path)) {
+                return 0;
+            }
+            strcat(path, "/voice");
+            if (!add_scoped(desired, NULL, path, NULL, voice)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+export int add_declared(resources::set *desired, yyjson_val *manifest) {
+    return yyjson_is_obj(manifest) &&
+           add_collection(desired, manifest, "messaging_profiles") &&
+           add_collection(desired, manifest, "outbound_voice_profiles") &&
+           add_collection(desired, manifest, "credential_connections") &&
+           add_declared_phones(desired, manifest) &&
+           add_array_collection(desired, manifest, "messaging_phone_numbers", "phone_number");
+}
+
+static const char *declared_path(const resources::set *scope, const char *collection, const char *identity_field, yyjson_val *actual) {
+    const char *identity;
+    char prefix[512];
+    size_t index;
+
+    identity = yyjson_get_str(yyjson_obj_get(actual, identity_field));
+    if (!identity || strlen(collection) + sizeof("telnyx//") > sizeof(prefix)) {
+        return NULL;
+    }
+    sprintf(prefix, "telnyx/%s/", collection);
+    for (index = 0; index < scope->count; ++index) {
+        if (strncmp(scope->items[index].path, prefix, strlen(prefix)) == 0 &&
+            yyjson_equals_str(yyjson_obj_get(scope->items[index].json, identity_field), identity)) {
+            return scope->items[index].path;
+        }
+    }
+    return NULL;
+}
+
+static int fetch_collection(const char *collection, const char *identity_field, int named, resources::set *remote, const resources::set *scope) {
+    const char *identifier;
+    const char *identity;
+    char path[4096];
+    yyjson_doc *items_document;
+    yyjson_mut_doc *mutable_document;
+    yyjson_mut_val *mutable_items;
+    yyjson_val *item;
+    yyjson_val *items;
+    size_t index;
+    size_t count;
+    int success;
+
+    mutable_document = yyjson_mut_doc_new(NULL);
+    mutable_items = mutable_document ? yyjson_mut_arr(mutable_document) : NULL;
+    success = mutable_items && fetch_list(collection, mutable_document, mutable_items);
+    items_document = success ? yyjson_mut_val_imut_copy(mutable_items, NULL) : NULL;
+    yyjson_mut_doc_free(mutable_document);
+    items = items_document ? yyjson_doc_get_root(items_document) : NULL;
+    if (!yyjson_is_arr(items)) {
+        yyjson_doc_free(items_document);
+        return 0;
+    }
+    success = 1;
+    yyjson_arr_foreach(items, index, count, item) {
+        identity = yyjson_get_str(yyjson_obj_get(item, identity_field));
+        identifier = yyjson_get_str(yyjson_obj_get(item, "id"));
+        if (named) {
+            const char *matched_path;
+
+            matched_path = declared_path(scope, collection, identity_field, item);
+            if (!matched_path) {
+                continue;
+            }
+            if (strlen(matched_path) >= sizeof(path)) {
+                success = 0;
+                break;
+            }
+            memcpy(path, matched_path, strlen(matched_path) + 1);
+        } else if (!resource_path(path, sizeof(path), collection, identity)) {
+            success = 0;
+            break;
+        }
+        if (!add_scoped(remote, scope, path, identifier, item) ||
+            (named && (!identifier || !save_reference(path, identifier)))) {
+            success = 0;
+            break;
+        }
+    }
+    yyjson_doc_free(items_document);
+    return success;
+}
+
+static const char *phone_number_for_id(const resources::set *remote, const char *identifier) {
+    const char *prefix;
+    size_t index;
+
+    prefix = "telnyx/phone_numbers/";
+    for (index = 0; index < remote->count; ++index) {
+        if (remote->items[index].identifier && strcmp(remote->items[index].identifier, identifier) == 0 &&
+            strncmp(remote->items[index].path, prefix, strlen(prefix)) == 0 &&
+            !strstr(remote->items[index].path + strlen(prefix), "/voice")) {
+            return remote->items[index].path + strlen(prefix);
+        }
+    }
+    return NULL;
+}
+
+static int fetch_phone_voice(resources::set *remote, const resources::set *scope) {
+    const char *identifier;
+    const char *number;
+    char path[4096];
+    yyjson_doc *items_document;
+    yyjson_mut_doc *document;
+    yyjson_mut_val *mutable_items;
+    yyjson_val *item;
+    yyjson_val *items;
+    size_t index;
+    size_t count;
+    int success;
+
+    document = yyjson_mut_doc_new(NULL);
+    mutable_items = document ? yyjson_mut_arr(document) : NULL;
+    success = mutable_items && fetch_list("phone_numbers/voice", document, mutable_items);
+    items_document = success ? yyjson_mut_val_imut_copy(mutable_items, NULL) : NULL;
+    yyjson_mut_doc_free(document);
+    items = items_document ? yyjson_doc_get_root(items_document) : NULL;
+    if (!yyjson_is_arr(items)) {
+        yyjson_doc_free(items_document);
+        return 0;
+    }
+    success = 1;
+    yyjson_arr_foreach(items, index, count, item) {
+        identifier = yyjson_get_str(yyjson_obj_get(item, "id"));
+        number = phone_number_for_id(remote, identifier);
+        if (!number) {
+            continue;
+        }
+        if (!resource_path(path, sizeof(path), "phone_numbers", number) ||
+            strlen(path) + sizeof("/voice") > sizeof(path)) {
+            success = 0;
+            break;
+        }
+        strcat(path, "/voice");
+        if (!add_scoped(remote, scope, path, identifier, item)) {
+            success = 0;
+            break;
+        }
+    }
+    yyjson_doc_free(items_document);
+    return success;
+}
+
+export int fetch(resources::set *remote, const resources::set *scope) {
+    return fetch_collection("messaging_profiles", "name", 1, remote, scope) &&
+           fetch_collection("outbound_voice_profiles", "name", 1, remote, scope) &&
+           fetch_collection("credential_connections", "connection_name", 1, remote, scope) &&
+           fetch_collection("phone_numbers", "phone_number", 0, remote, scope) &&
+           fetch_phone_voice(remote, scope) &&
+           fetch_collection("messaging_phone_numbers", "phone_number", 0, remote, scope);
+}
+
+static yyjson_mut_val *resolve_value(yyjson_mut_doc *document, yyjson_val *value, int require_reference) {
+    const char *identifier;
+    const char *text;
+    char expression[4096];
+    yyjson_mut_val *copy;
+    yyjson_mut_val *item_copy;
+    yyjson_val *item;
+    yyjson_val *key;
+    size_t index;
+    size_t count;
+    size_t length;
+
+    if (yyjson_is_str(value)) {
+        text = yyjson_get_str(value);
+        length = strlen(text);
+        if (length > 3 && text[0] == '$' && text[1] == '{' && text[length - 1] == '}') {
+            if (length - 3 >= sizeof(expression)) {
+                return NULL;
+            }
+            memcpy(expression, text + 2, length - 3);
+            expression[length - 3] = '\0';
+            identifier = reference_identifier(expression);
+            if (identifier) {
+                return yyjson_mut_strcpy(document, identifier);
+            }
+            if (require_reference) {
+                return NULL;
+            }
+        }
+    }
+    if (yyjson_is_arr(value)) {
+        copy = yyjson_mut_arr(document);
+        yyjson_arr_foreach(value, index, count, item) {
+            item_copy = resolve_value(document, item, require_reference);
+            if (!copy || !item_copy || !yyjson_mut_arr_add_val(copy, item_copy)) {
+                return NULL;
+            }
+        }
+        return copy;
+    }
+    if (yyjson_is_obj(value)) {
+        copy = yyjson_mut_obj(document);
+        yyjson_obj_foreach(value, index, count, key, item) {
+            item_copy = resolve_value(document, item, require_reference);
+            if (!copy || !item_copy || !yyjson_mut_obj_add_val(document, copy, yyjson_get_str(key), item_copy)) {
+                return NULL;
+            }
+        }
+        return copy;
+    }
+    return yyjson_val_mut_copy(document, value);
+}
+
+static int resolve_desired_references(resources::set *desired) {
+    yyjson_doc *copy_document;
+    yyjson_mut_doc *document;
+    yyjson_mut_val *copy;
+    size_t index;
+    int success;
+
+    for (index = 0; index < desired->count; ++index) {
+        document = yyjson_mut_doc_new(NULL);
+        copy = document ? resolve_value(document, desired->items[index].json, 0) : NULL;
+        copy_document = copy ? yyjson_mut_val_imut_copy(copy, NULL) : NULL;
+        success = copy_document && resources::add_json_resource(
+            desired,
+            desired->items[index].path,
+            desired->items[index].type,
+            desired->items[index].identifier,
+            yyjson_doc_get_root(copy_document));
+        yyjson_doc_free(copy_document);
+        yyjson_mut_doc_free(document);
+        if (!success) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+export int add_configuration(yyjson_val *declaration, resources::set *remote, resources::set *desired) {
+    clear_references();
+    return add_declared(desired, declaration) && fetch(remote, desired) &&
+           resolve_desired_references(desired);
+}
+
+static yyjson_mut_val *request_body(yyjson_mut_doc *document, yyjson_val *value, const char *excluded, const char *also_excluded) {
+    yyjson_mut_val *body;
+    yyjson_mut_val *copy;
+    yyjson_val *key;
+    yyjson_val *field;
+    size_t index;
+    size_t count;
+
+    body = yyjson_mut_obj(document);
+    yyjson_obj_foreach(value, index, count, key, field) {
+        if ((excluded && yyjson_equals_str(key, excluded)) ||
+            (also_excluded && yyjson_equals_str(key, also_excluded))) {
+            continue;
+        }
+        copy = resolve_value(document, field, 1);
+        if (!copy || !yyjson_mut_obj_add_val(document, body, yyjson_get_str(key), copy)) {
+            return NULL;
+        }
+    }
+    return body;
+}
+
+static int patch(const char *endpoint, yyjson_val *value, const char *excluded, const char *also_excluded) {
+    char *body_json;
+    yyjson_doc *response_document;
+    yyjson_mut_doc *document;
+    yyjson_mut_val *body;
+    yyjson_val *response;
+    int success;
+
+    response_document = NULL;
+    document = yyjson_mut_doc_new(NULL);
+    body = document ? request_body(document, value, excluded, also_excluded) : NULL;
+    body_json = body ? yyjson_mut_val_write(body, 0, NULL) : NULL;
+    success = body_json && request("PATCH", endpoint, body_json, &response_document, &response);
+    free(body_json);
+    yyjson_doc_free(response_document);
+    yyjson_mut_doc_free(document);
+    return success;
+}
+
+static int create(const char *collection, const resources::resource *resource) {
+    const char *identifier;
+    char *body_json;
+    yyjson_doc *response_document;
+    yyjson_mut_doc *document;
+    yyjson_mut_val *body;
+    yyjson_val *response;
+    int success;
+
+    response_document = NULL;
+    document = yyjson_mut_doc_new(NULL);
+    body = document ? request_body(document, resource->json, NULL, NULL) : NULL;
+    body_json = body ? yyjson_mut_val_write(body, 0, NULL) : NULL;
+    success = body_json && request("POST", collection, body_json, &response_document, &response);
+    identifier = success ? yyjson_get_str(yyjson_obj_get(response, "id")) : NULL;
+    success = identifier && save_reference(resource->path, identifier);
+    free(body_json);
+    yyjson_doc_free(response_document);
+    yyjson_mut_doc_free(document);
+    return success;
+}
+
+export int apply(const resources::diff *diff) {
+    const char *identifier;
+    const char *number;
+    const char *path;
+    char endpoint[4096];
+
+    if (diff->action == resources::REMOVE) {
+        fail("phone number and profile removal is not supported");
+        return 0;
+    }
+    if (diff->action == resources::PUSH && diff->desired && diff->desired->json) {
+        path = diff->desired->path;
+        if (strncmp(path, "telnyx/messaging_profiles/", sizeof("telnyx/messaging_profiles/") - 1) == 0) {
+            return create("messaging_profiles", diff->desired);
+        }
+        if (strncmp(path, "telnyx/outbound_voice_profiles/", sizeof("telnyx/outbound_voice_profiles/") - 1) == 0) {
+            return create("outbound_voice_profiles", diff->desired);
+        }
+        if (strncmp(path, "telnyx/credential_connections/", sizeof("telnyx/credential_connections/") - 1) == 0) {
+            return create("credential_connections", diff->desired);
+        }
+        fail("declared Telnyx resource does not exist");
+        return 0;
+    }
+    if (diff->action != resources::UPDATE || !diff->remote || !diff->desired ||
+        !diff->remote->json || !diff->desired->json) {
+        fail("declared Telnyx resource does not exist");
+        return 0;
+    }
+    path = diff->desired->path;
+    identifier = diff->remote->identifier;
+    if (strncmp(path, "telnyx/messaging_profiles/", sizeof("telnyx/messaging_profiles/") - 1) == 0) {
+        if (!identifier) {
+            return 0;
+        }
+        sprintf(endpoint, "messaging_profiles/%s", identifier);
+        return patch(endpoint, diff->desired->json, "id", NULL);
+    }
+    if (strncmp(path, "telnyx/outbound_voice_profiles/", sizeof("telnyx/outbound_voice_profiles/") - 1) == 0) {
+        if (!identifier) {
+            return 0;
+        }
+        sprintf(endpoint, "outbound_voice_profiles/%s", identifier);
+        return patch(endpoint, diff->desired->json, "id", NULL);
+    }
+    if (strncmp(path, "telnyx/credential_connections/", sizeof("telnyx/credential_connections/") - 1) == 0) {
+        if (!identifier) {
+            return 0;
+        }
+        sprintf(endpoint, "credential_connections/%s", identifier);
+        return patch(endpoint, diff->desired->json, "id", NULL);
+    }
+    if (strncmp(path, "telnyx/phone_numbers/", sizeof("telnyx/phone_numbers/") - 1) == 0) {
+        if (!identifier) {
+            return 0;
+        }
+        if (strlen(path) >= sizeof("/voice") - 1 &&
+            strcmp(path + strlen(path) - (sizeof("/voice") - 1), "/voice") == 0) {
+            sprintf(endpoint, "phone_numbers/%s/voice", identifier);
+            return patch(endpoint, diff->desired->json, NULL, NULL);
+        }
+        sprintf(endpoint, "phone_numbers/%s", identifier);
+        return patch(endpoint, diff->desired->json, "phone_number", "id");
+    }
+    if (strncmp(path, "telnyx/messaging_phone_numbers/", sizeof("telnyx/messaging_phone_numbers/") - 1) == 0) {
+        number = yyjson_get_str(yyjson_obj_get(diff->desired->json, "phone_number"));
+        if (!number || strlen(number) + sizeof("messaging_phone_numbers/") > sizeof(endpoint)) {
+            return 0;
+        }
+        sprintf(endpoint, "messaging_phone_numbers/%s", number);
+        return patch(endpoint, diff->desired->json, "phone_number", "id");
+    }
+    fail("unknown Telnyx resource");
+    return 0;
+}
+
+}

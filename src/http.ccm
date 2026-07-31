@@ -1,0 +1,105 @@
+module;
+
+#include <curl/curl.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
+export module http;
+
+namespace http {
+
+export typedef struct response {
+    char *body;
+    size_t length;
+    long status;
+} response;
+
+static size_t write(char *data, size_t size, size_t count, void *context) {
+    response *result;
+    char *body;
+    size_t length;
+
+    result = (response *)context;
+    length = size * count;
+    body = (char *)realloc(result->body, result->length + length + 1);
+    if (!body) {
+        return 0;
+    }
+    result->body = body;
+    memcpy(result->body + result->length, data, length);
+    result->length += length;
+    result->body[result->length] = '\0';
+    return length;
+}
+
+export int init(void) {
+    return curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+}
+
+export void cleanup(void) {
+    curl_global_cleanup();
+}
+
+static int perform(const char *method, const char *url, const char **headers, size_t header_count, const char *body, response *result) {
+    CURL *curl;
+    CURLcode code;
+    struct curl_slist *curl_headers;
+    struct curl_slist *next_headers;
+    size_t index;
+
+    memset(result, 0, sizeof(*result));
+    curl = curl_easy_init();
+    if (!curl) {
+        return 0;
+    }
+    curl_headers = NULL;
+    for (index = 0; index < header_count; ++index) {
+        next_headers = curl_slist_append(curl_headers, headers[index]);
+        if (!next_headers) {
+            curl_slist_free_all(curl_headers);
+            curl_easy_cleanup(curl);
+            return 0;
+        }
+        curl_headers = next_headers;
+    }
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, result);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    if (body) {
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    }
+    code = curl_easy_perform(curl);
+    if (code == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result->status);
+    }
+    curl_slist_free_all(curl_headers);
+    curl_easy_cleanup(curl);
+    if (code != CURLE_OK) {
+        free(result->body);
+        memset(result, 0, sizeof(*result));
+        return 0;
+    }
+    if (!result->body) {
+        result->body = (char *)malloc(1);
+        if (!result->body) {
+            return 0;
+        }
+        result->body[0] = '\0';
+    }
+    return 1;
+}
+
+export int request(const char *method, const char *url, const char **headers, size_t header_count, const char *body, response *result) {
+    return perform(method, url, headers, header_count, body, result);
+}
+
+export void release(response *result) {
+    free(result->body);
+    memset(result, 0, sizeof(*result));
+}
+
+}

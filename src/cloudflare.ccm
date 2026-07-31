@@ -1,0 +1,1180 @@
+module;
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <yyjson.h>
+
+export module cloudflare;
+
+import http;
+import resources;
+
+namespace cloudflare {
+
+static const char *api_token;
+static const char *account_id;
+static char last_error[512];
+static long last_status;
+
+export typedef struct zone {
+    char *id;
+    char *name;
+} zone;
+
+export typedef struct zones {
+    zone *items;
+    size_t count;
+} zones;
+
+static char *copy(const char *text) {
+    char *result;
+    size_t length;
+
+    length = strlen(text);
+    result = (char *)malloc(length + 1);
+    if (result) {
+        memcpy(result, text, length + 1);
+    }
+    return result;
+}
+
+export void init(const char *token, const char *account) {
+    api_token = token;
+    account_id = account;
+}
+
+export int configure(void) {
+    const char *account;
+    const char *token;
+
+    token = getenv("CLOUDFLARE_API_TOKEN");
+    account = getenv("CLOUDFLARE_ACCOUNT_ID");
+    if (!token || !*token || !account || !*account) {
+        memcpy(last_error, "missing credentials", sizeof("missing credentials"));
+        return 0;
+    }
+    init(token, account);
+    return 1;
+}
+
+export const char *error(void) {
+    return last_error;
+}
+
+static const char *error_message(yyjson_val *root) {
+    yyjson_val *errors;
+    yyjson_val *error_value;
+    yyjson_val *message;
+
+    errors = yyjson_obj_get(root, "errors");
+    if (!yyjson_is_arr(errors) || yyjson_arr_size(errors) == 0) {
+        return NULL;
+    }
+    error_value = yyjson_arr_get_first(errors);
+    message = yyjson_obj_get(error_value, "message");
+    return yyjson_is_str(message) ? yyjson_get_str(message) : NULL;
+}
+
+static int request(const char *method, const char *path, const char *body, yyjson_doc **document, yyjson_val **result) {
+    const char *headers[2];
+    char authorization[1024];
+    char url[2048];
+    http::response response;
+    yyjson_doc *parsed;
+    yyjson_val *root;
+    const char *message;
+    long status;
+
+    *document = NULL;
+    *result = NULL;
+    last_error[0] = '\0';
+    last_status = 0;
+    if (!api_token || strlen(api_token) + sizeof("Authorization: Bearer ") > sizeof(authorization) || strlen(path) + sizeof("https://api.cloudflare.com/client/v4/") > sizeof(url)) {
+        return 0;
+    }
+    sprintf(authorization, "Authorization: Bearer %s", api_token);
+    sprintf(url, "https://api.cloudflare.com/client/v4/%s", path);
+    headers[0] = authorization;
+    headers[1] = "Content-Type: application/json";
+    if (!http::request(method, url, headers, 2, body, &response)) {
+        memcpy(last_error, "HTTP request failed", sizeof("HTTP request failed"));
+        return 0;
+    }
+    status = response.status;
+    last_status = status;
+    if (status >= 200 && status < 300 && response.length == 0) {
+        http::release(&response);
+        return 1;
+    }
+    parsed = yyjson_read(response.body, response.length, 0);
+    http::release(&response);
+    if (!parsed) {
+        memcpy(last_error, "invalid JSON response", sizeof("invalid JSON response"));
+        return 0;
+    }
+    root = yyjson_doc_get_root(parsed);
+    if (status < 200 || status >= 300 || !yyjson_is_true(yyjson_obj_get(root, "success"))) {
+        message = error_message(root);
+        if (message) {
+            size_t length;
+
+            length = strlen(message);
+            if (length >= sizeof(last_error)) {
+                length = sizeof(last_error) - 1;
+            }
+            memcpy(last_error, message, length);
+            last_error[length] = '\0';
+        } else {
+            memcpy(last_error, "request rejected", sizeof("request rejected"));
+        }
+        yyjson_doc_free(parsed);
+        return 0;
+    }
+    *document = parsed;
+    *result = yyjson_obj_get(root, "result");
+    return 1;
+}
+
+static int missing(void) {
+    return last_status == 404;
+}
+
+static int conflict(void) {
+    return last_status == 400 || last_status == 409;
+}
+
+static int append_zone(zones *result, const char *id, const char *name) {
+    zone *items;
+    char *owned_id;
+    char *owned_name;
+
+    owned_id = copy(id);
+    owned_name = copy(name);
+    if (!owned_id || !owned_name) {
+        free(owned_id);
+        free(owned_name);
+        return 0;
+    }
+    items = (zone *)realloc(result->items, (result->count + 1) * sizeof(*items));
+    if (!items) {
+        free(owned_id);
+        free(owned_name);
+        return 0;
+    }
+    result->items = items;
+    result->items[result->count].id = owned_id;
+    result->items[result->count].name = owned_name;
+    ++result->count;
+    return 1;
+}
+
+export void release_zones(zones *value) {
+    size_t index;
+
+    for (index = 0; index < value->count; ++index) {
+        free(value->items[index].id);
+        free(value->items[index].name);
+    }
+    free(value->items);
+    value->items = NULL;
+    value->count = 0;
+}
+
+export int fetch_zones(zones *result) {
+    char path[128];
+    const char *id;
+    const char *name;
+    yyjson_doc *document;
+    yyjson_val *items;
+    yyjson_val *item;
+    yyjson_val *root;
+    yyjson_val *information;
+    yyjson_val *pages_value;
+    size_t index;
+    size_t count;
+    size_t page;
+    size_t pages;
+
+    result->items = NULL;
+    result->count = 0;
+    page = 1;
+    pages = 1;
+    while (page <= pages && page < 100) {
+        sprintf(path, "zones?per_page=10&page=%lu", (unsigned long)page);
+        if (!request("GET", path, NULL, &document, &items) || !document || !yyjson_is_arr(items)) {
+            release_zones(result);
+            return 0;
+        }
+        count = yyjson_arr_size(items);
+        for (index = 0; index < count; ++index) {
+            item = yyjson_arr_get(items, index);
+            id = yyjson_get_str(yyjson_obj_get(item, "id"));
+            name = yyjson_get_str(yyjson_obj_get(item, "name"));
+            if (!id || !name || !append_zone(result, id, name)) {
+                yyjson_doc_free(document);
+                release_zones(result);
+                return 0;
+            }
+        }
+        root = yyjson_doc_get_root(document);
+        information = yyjson_obj_get(root, "result_info");
+        pages_value = yyjson_obj_get(information, "total_pages");
+        pages = yyjson_is_uint(pages_value) ? (size_t)yyjson_get_uint(pages_value) : page;
+        yyjson_doc_free(document);
+        ++page;
+    }
+    return 1;
+}
+
+static int add_page_domain(resources::set *collection, const resources::set *scope, const char *page, const char *hostname, const char *identifier, yyjson_val *value) {
+    char path[4096];
+
+    if (strlen(page) + strlen(hostname) + sizeof("page_domains//") > sizeof(path)) {
+        return 0;
+    }
+    sprintf(path, "page_domains/%s/%s", page, hostname);
+    if (scope && !resources::contains_path(scope, path, resources::PAGE_DOMAIN)) {
+        return 1;
+    }
+    return resources::add_json_resource(collection, path, resources::PAGE_DOMAIN, identifier, value);
+}
+
+export int add_declared_pages(resources::set *desired, yyjson_val *pages) {
+    const char *hostname;
+    const char *project_name;
+    yyjson_val *domain;
+    yyjson_val *domains;
+    yyjson_val *project;
+    yyjson_val *project_key;
+    yyjson_val *projects;
+    size_t domain_index;
+    size_t domain_count;
+    size_t project_index;
+    size_t project_count;
+
+    projects = yyjson_obj_get(pages, "projects");
+    if (!yyjson_is_obj(projects)) {
+        return 0;
+    }
+    yyjson_obj_foreach(projects, project_index, project_count, project_key, project) {
+        project_name = yyjson_get_str(project_key);
+        domains = yyjson_obj_get(project, "domains");
+        if (!project_name || !yyjson_is_obj(project) || !yyjson_is_arr(domains)) {
+            return 0;
+        }
+        yyjson_arr_foreach(domains, domain_index, domain_count, domain) {
+            hostname = yyjson_get_str(yyjson_obj_get(domain, "name"));
+            if (!hostname || !yyjson_is_obj(domain) || !add_page_domain(desired, NULL, project_name, hostname, NULL, domain)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+export int fetch_page_domains(yyjson_val *pages, resources::set *remote, const resources::set *scope) {
+    char path[1024];
+    const char *hostname;
+    const char *identifier;
+    const char *project_name;
+    yyjson_doc *document;
+    yyjson_val *domains;
+    yyjson_val *items;
+    yyjson_val *item;
+    yyjson_val *project;
+    yyjson_val *project_key;
+    yyjson_val *projects;
+    yyjson_val *root;
+    yyjson_val *information;
+    yyjson_val *pages_value;
+    size_t project_index;
+    size_t project_count;
+    size_t index;
+    size_t count;
+    size_t page;
+    size_t page_count;
+
+    projects = yyjson_obj_get(pages, "projects");
+    if (!yyjson_is_obj(projects)) {
+        return 0;
+    }
+    yyjson_obj_foreach(projects, project_index, project_count, project_key, project) {
+        project_name = yyjson_get_str(project_key);
+        domains = yyjson_obj_get(project, "domains");
+        if (!project_name || !yyjson_is_arr(domains)) {
+            return 0;
+        }
+        page = 1;
+        page_count = 1;
+        while (page <= page_count && page < 100) {
+            if (!account_id || strlen(account_id) + strlen(project_name) +
+                                   sizeof("accounts//pages/projects//domains?per_page=10&page=18446744073709551615") >
+                                       sizeof(path)) {
+                return 0;
+            }
+            sprintf(path, "accounts/%s/pages/projects/%s/domains?per_page=10&page=%lu", account_id, project_name, (unsigned long)page);
+            if (!request("GET", path, NULL, &document, &items) || !document || !yyjson_is_arr(items)) {
+                return 0;
+            }
+            count = yyjson_arr_size(items);
+            for (index = 0; index < count; ++index) {
+                item = yyjson_arr_get(items, index);
+                hostname = yyjson_get_str(yyjson_obj_get(item, "name"));
+                identifier = yyjson_get_str(yyjson_obj_get(item, "id"));
+                if (!add_page_domain(remote, scope, project_name, hostname, identifier ? identifier : hostname, item)) {
+                    yyjson_doc_free(document);
+                    return 0;
+                }
+            }
+            root = yyjson_doc_get_root(document);
+            information = yyjson_obj_get(root, "result_info");
+            pages_value = yyjson_obj_get(information, "total_pages");
+            page_count = yyjson_is_uint(pages_value) ? (size_t)yyjson_get_uint(pages_value) : page;
+            yyjson_doc_free(document);
+            ++page;
+        }
+    }
+    return 1;
+}
+static int add_worker_domain(resources::set *collection, const resources::set *scope, const char *identifier, yyjson_val *domain) {
+    const char *hostname;
+    char path[4096];
+
+    hostname = yyjson_get_str(yyjson_obj_get(domain, "hostname"));
+    if (!hostname || strlen(hostname) + sizeof("worker_domains/") > sizeof(path)) {
+        return 0;
+    }
+    sprintf(path, "worker_domains/%s", hostname);
+    if (scope && !resources::contains_path(scope, path, resources::WORKER_DOMAIN)) {
+        return 1;
+    }
+    return resources::add_json_resource(collection, path, resources::WORKER_DOMAIN, identifier, domain);
+}
+
+export int fetch_worker_domains(resources::set *remote, const resources::set *scope) {
+    char path[512];
+    const char *identifier;
+    yyjson_doc *document;
+    yyjson_val *items;
+    yyjson_val *item;
+    yyjson_val *root;
+    yyjson_val *information;
+    yyjson_val *pages_value;
+    size_t index;
+    size_t count;
+    size_t page;
+    size_t pages;
+
+    page = 1;
+    pages = 1;
+    while (page <= pages && page < 100) {
+        if (!account_id || strlen(account_id) + sizeof("accounts//workers/domains?per_page=10&page=18446744073709551615") > sizeof(path)) {
+            return 0;
+        }
+        sprintf(path, "accounts/%s/workers/domains?per_page=10&page=%lu", account_id, (unsigned long)page);
+        if (!request("GET", path, NULL, &document, &items) || !document || !yyjson_is_arr(items)) {
+            return 0;
+        }
+        count = yyjson_arr_size(items);
+        for (index = 0; index < count; ++index) {
+            item = yyjson_arr_get(items, index);
+            identifier = yyjson_get_str(yyjson_obj_get(item, "id"));
+            if (!identifier || !add_worker_domain(remote, scope, identifier, item)) {
+                yyjson_doc_free(document);
+                return 0;
+            }
+        }
+        root = yyjson_doc_get_root(document);
+        information = yyjson_obj_get(root, "result_info");
+        pages_value = yyjson_obj_get(information, "total_pages");
+        pages = yyjson_is_uint(pages_value) ? (size_t)yyjson_get_uint(pages_value) : page;
+        yyjson_doc_free(document);
+        ++page;
+    }
+    return 1;
+}
+
+export int fetch_declared_workers(yyjson_val *workers, resources::set *remote, resources::set *desired) {
+    const char *name;
+    char endpoint[1024];
+    char path[1024];
+    yyjson_doc *document;
+    yyjson_val *key;
+    yyjson_val *settings;
+    yyjson_val *worker;
+    yyjson_val *declared_settings;
+    size_t index;
+    size_t count;
+
+    if (!yyjson_is_obj(workers)) {
+        return 0;
+    }
+    yyjson_obj_foreach(workers, index, count, key, worker) {
+        name = yyjson_get_str(key);
+        declared_settings = yyjson_obj_get(worker, "script-settings");
+        if (!name || !yyjson_is_obj(worker) || !yyjson_is_obj(declared_settings) || !account_id ||
+            strlen(account_id) + strlen(name) + sizeof("accounts//workers/scripts//script-settings") > sizeof(endpoint) ||
+            strlen(name) + sizeof("workers//script-settings") > sizeof(path)) {
+            return 0;
+        }
+        sprintf(endpoint, "accounts/%s/workers/scripts/%s/script-settings", account_id, name);
+        sprintf(path, "workers/%s/script-settings", name);
+        if (!request("GET", endpoint, NULL, &document, &settings)) {
+            return 0;
+        }
+        if (!yyjson_is_obj(settings) || !resources::add_json_resource(remote, path, resources::WORKER_SETTING, name, settings) ||
+            !resources::add_json_resource(desired, path, resources::WORKER_SETTING, name, declared_settings)) {
+            yyjson_doc_free(document);
+            return 0;
+        }
+        yyjson_doc_free(document);
+    }
+    return 1;
+}
+
+export int add_desired_worker_domain_json(resources::set *desired, yyjson_val *value) {
+    const char *hostname;
+
+    hostname = yyjson_get_str(yyjson_obj_get(value, "hostname"));
+    return hostname && add_worker_domain(desired, NULL, NULL, value);
+}
+
+export int add_declared_worker_domains(resources::set *desired, yyjson_val *domains) {
+    yyjson_val *domain;
+    size_t domain_index;
+    size_t domain_count;
+
+    if (!yyjson_is_arr(domains)) {
+        return 0;
+    }
+    yyjson_arr_foreach(domains, domain_index, domain_count, domain) {
+        if (!yyjson_is_obj(domain) || !add_desired_worker_domain_json(desired, domain)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static const char *declared_record_path(const resources::set *scope, yyjson_val *record) {
+    const char *content;
+    const char *declared_content;
+    const char *name;
+    const char *type;
+    const char *single_path;
+    yyjson_val *data;
+    yyjson_val *declared;
+    size_t candidates;
+    size_t index;
+
+    name = yyjson_get_str(yyjson_obj_get(record, "name"));
+    type = yyjson_get_str(yyjson_obj_get(record, "type"));
+    content = yyjson_get_str(yyjson_obj_get(record, "content"));
+    data = yyjson_obj_get(record, "data");
+    candidates = 0;
+    single_path = NULL;
+    for (index = 0; scope && index < scope->count; ++index) {
+        declared = scope->items[index].json;
+        if (scope->items[index].type == resources::DNS_RECORD && yyjson_equals_str(yyjson_obj_get(declared, "name"), name) &&
+            yyjson_equals_str(yyjson_obj_get(declared, "type"), type)) {
+            ++candidates;
+            single_path = scope->items[index].path;
+        }
+    }
+    if (candidates == 1) {
+        return single_path;
+    }
+    for (index = 0; scope && index < scope->count; ++index) {
+        declared = scope->items[index].json;
+        declared_content = yyjson_get_str(yyjson_obj_get(declared, "content"));
+        if (scope->items[index].type == resources::DNS_RECORD && yyjson_equals_str(yyjson_obj_get(declared, "name"), name) &&
+            yyjson_equals_str(yyjson_obj_get(declared, "type"), type) &&
+            ((content && declared_content && strcmp(content, declared_content) == 0) ||
+             (!content && !declared_content && yyjson_equals(data, yyjson_obj_get(declared, "data"))))) {
+            return scope->items[index].path;
+        }
+    }
+    return NULL;
+}
+static int add_record(resources::set *collection, const resources::set *scope, const zone *zone, yyjson_val *record, const char *identifier) {
+    const char *content;
+    const char *name;
+    const char *type;
+    char path[4096];
+    char *data;
+    const char *resource_path;
+    yyjson_val *data_value;
+    int success;
+
+    name = yyjson_get_str(yyjson_obj_get(record, "name"));
+    type = yyjson_get_str(yyjson_obj_get(record, "type"));
+    content = yyjson_get_str(yyjson_obj_get(record, "content"));
+    data_value = yyjson_obj_get(record, "data");
+    data = !content && data_value ? yyjson_val_write(data_value, 0, NULL) : NULL;
+    if (!name || !type || (!content && !data) || strlen(zone->name) + strlen(name) + strlen(type) + strlen(content ? content : data) + sizeof("zones//dns_records///") > sizeof(path)) {
+        free(data);
+        return 0;
+    }
+    sprintf(path, "zones/%s/dns_records/%s/%s/%s", zone->name, name, type, content ? content : data);
+    resource_path = scope ? declared_record_path(scope, record) : path;
+    if (!resource_path) {
+        free(data);
+        return 1;
+    }
+    success = resources::add_json_resource(collection, resource_path, resources::DNS_RECORD, identifier, record);
+    free(data);
+    return success;
+}
+export int fetch_records(const zone *zone, resources::set *remote, const resources::set *scope) {
+    char path[256];
+    yyjson_doc *document;
+    yyjson_val *items;
+    yyjson_val *item;
+    yyjson_val *root;
+    yyjson_val *information;
+    yyjson_val *pages_value;
+    size_t index;
+    size_t count;
+    size_t page;
+    size_t pages;
+
+    page = 1;
+    pages = 1;
+    while (page <= pages && page < 100) {
+        if (strlen(zone->id) + sizeof("zones//dns_records?per_page=10&page=18446744073709551615") > sizeof(path)) {
+            return 0;
+        }
+        sprintf(path, "zones/%s/dns_records?per_page=10&page=%lu", zone->id, (unsigned long)page);
+        if (!request("GET", path, NULL, &document, &items) || !document || !yyjson_is_arr(items)) {
+            return 0;
+        }
+        count = yyjson_arr_size(items);
+        for (index = 0; index < count; ++index) {
+            item = yyjson_arr_get(items, index);
+            if (!add_record(remote, scope, zone, item, yyjson_get_str(yyjson_obj_get(item, "id")))) {
+                yyjson_doc_free(document);
+                return 0;
+            }
+        }
+        root = yyjson_doc_get_root(document);
+        information = yyjson_obj_get(root, "result_info");
+        pages_value = yyjson_obj_get(information, "total_pages");
+        pages = yyjson_is_uint(pages_value) ? (size_t)yyjson_get_uint(pages_value) : page;
+        yyjson_doc_free(document);
+        ++page;
+    }
+    return 1;
+}
+
+static int add_route(resources::set *collection, const resources::set *scope, const zone *zone, yyjson_val *route, const char *identifier) {
+    const char *pattern;
+    char path[4096];
+
+    pattern = yyjson_get_str(yyjson_obj_get(route, "pattern"));
+    if (!pattern || strlen(zone->name) + strlen(pattern) + sizeof("zones//routes/") > sizeof(path)) {
+        return 0;
+    }
+    sprintf(path, "zones/%s/routes/%s", zone->name, pattern);
+    if (scope && !resources::contains_path(scope, path, resources::WORKER_ROUTE)) {
+        return 1;
+    }
+    return resources::add_json_resource(collection, path, resources::WORKER_ROUTE, identifier, route);
+}
+
+export int fetch_routes(const zone *zone, resources::set *remote, const resources::set *scope) {
+    char path[256];
+    const char *identifier;
+    yyjson_doc *document;
+    yyjson_val *items;
+    yyjson_val *item;
+    yyjson_val *root;
+    yyjson_val *information;
+    yyjson_val *pages_value;
+    size_t index;
+    size_t count;
+    size_t page;
+    size_t pages;
+
+    page = 1;
+    pages = 1;
+    while (page <= pages && page < 100) {
+        if (strlen(zone->id) + sizeof("zones//workers/routes?per_page=10&page=18446744073709551615") > sizeof(path)) {
+            return 0;
+        }
+        sprintf(path, "zones/%s/workers/routes?per_page=10&page=%lu", zone->id, (unsigned long)page);
+        if (!request("GET", path, NULL, &document, &items) || !document || !yyjson_is_arr(items)) {
+            return 0;
+        }
+        count = yyjson_arr_size(items);
+        for (index = 0; index < count; ++index) {
+            item = yyjson_arr_get(items, index);
+            identifier = yyjson_get_str(yyjson_obj_get(item, "id"));
+            if (!identifier || !add_route(remote, scope, zone, item, identifier)) {
+                yyjson_doc_free(document);
+                return 0;
+            }
+        }
+        root = yyjson_doc_get_root(document);
+        information = yyjson_obj_get(root, "result_info");
+        pages_value = yyjson_obj_get(information, "total_pages");
+        pages = yyjson_is_uint(pages_value) ? (size_t)yyjson_get_uint(pages_value) : page;
+        yyjson_doc_free(document);
+        ++page;
+    }
+    return 1;
+}
+
+export int add_desired_route_json(resources::set *desired, const zone *zone, yyjson_val *value) {
+    return add_route(desired, NULL, zone, value, NULL);
+}
+
+export int add_desired_record_json(resources::set *desired, const zone *zone, yyjson_val *value) {
+    return add_record(desired, NULL, zone, value, NULL);
+}
+static int add_email_routing(resources::set *collection, const zone *zone, yyjson_val *routing) {
+    char path[4096];
+
+    if (!yyjson_is_obj(routing) || strlen(zone->name) + sizeof("zones//email_routing_catch_all") > sizeof(path)) {
+        return 0;
+    }
+    sprintf(path, "zones/%s/email_routing_catch_all", zone->name);
+    return resources::add_json_resource(collection, path, resources::EMAIL_ROUTING, NULL, routing);
+}
+
+export int fetch_email_routing(const zone *zone, resources::set *remote) {
+    char endpoint[256];
+    yyjson_doc *document;
+    yyjson_val *routing;
+    int success;
+
+    if (strlen(zone->id) + sizeof("zones//email/routing/rules/catch_all") > sizeof(endpoint)) {
+        return 0;
+    }
+    sprintf(endpoint, "zones/%s/email/routing/rules/catch_all", zone->id);
+    if (!request("GET", endpoint, NULL, &document, &routing)) {
+        return missing();
+    }
+    success = add_email_routing(remote, zone, routing);
+    yyjson_doc_free(document);
+    return success;
+}
+
+export int add_desired_email_routing_json(resources::set *desired, const zone *zone, yyjson_val *value) {
+    return add_email_routing(desired, zone, value);
+}
+
+static int get_redirect_rules(const zone *zone, yyjson_doc **document, yyjson_val **ruleset) {
+    char endpoint[256];
+
+    if (strlen(zone->id) + sizeof("zones//rulesets/phases/http_request_dynamic_redirect/entrypoint") > sizeof(endpoint)) {
+        return 0;
+    }
+    sprintf(endpoint, "zones/%s/rulesets/phases/http_request_dynamic_redirect/entrypoint", zone->id);
+    if (!request("GET", endpoint, NULL, document, ruleset)) {
+        if (missing()) {
+            *document = NULL;
+            *ruleset = NULL;
+            return 1;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static int add_ruleset(resources::set *collection, const zone *zone, yyjson_val *ruleset, const char *identifier) {
+    char path[4096];
+
+    if (!yyjson_is_obj(ruleset) || strlen(zone->name) + sizeof("zones//rulesets/http_request_dynamic_redirect") > sizeof(path)) {
+        return 0;
+    }
+    sprintf(path, "zones/%s/rulesets/http_request_dynamic_redirect", zone->name);
+    return resources::add_json_resource(collection, path, resources::RULESET, identifier, ruleset);
+}
+
+export int fetch_redirects(const zone *zone, resources::set *remote) {
+    yyjson_doc *document;
+    yyjson_val *ruleset;
+    const char *identifier;
+    int success;
+
+    if (!get_redirect_rules(zone, &document, &ruleset)) {
+        return 0;
+    }
+    if (!ruleset) {
+        return 1;
+    }
+    identifier = yyjson_get_str(yyjson_obj_get(ruleset, "id"));
+    success = identifier && add_ruleset(remote, zone, ruleset, identifier);
+    yyjson_doc_free(document);
+    return success;
+}
+
+export int add_desired_redirect_json(resources::set *desired, const zone *zone, yyjson_val *value) {
+    return add_ruleset(desired, zone, value, NULL);
+}
+
+static int add_dnssec(resources::set *collection, const zone *zone, yyjson_val *value) {
+    char path[4096];
+
+    if (!yyjson_is_obj(value) || strlen(zone->name) + sizeof("zones//dnssec") > sizeof(path)) {
+        return 0;
+    }
+    sprintf(path, "zones/%s/dnssec", zone->name);
+    return resources::add_json_resource(collection, path, resources::DNSSEC, NULL, value);
+}
+
+export int fetch_dnssec(const zone *zone, resources::set *remote) {
+    char endpoint[256];
+    yyjson_doc *document;
+    yyjson_val *value;
+    int success;
+
+    if (strlen(zone->id) + sizeof("zones//dnssec") > sizeof(endpoint)) {
+        return 0;
+    }
+    sprintf(endpoint, "zones/%s/dnssec", zone->id);
+    if (!request("GET", endpoint, NULL, &document, &value)) {
+        return 0;
+    }
+    success = !yyjson_is_obj(value) || add_dnssec(remote, zone, value);
+    yyjson_doc_free(document);
+    return success;
+}
+
+export int add_desired_dnssec_json(resources::set *desired, const zone *zone, yyjson_val *value) {
+    return add_dnssec(desired, zone, value);
+}
+
+export int add_declared_resources(resources::set *desired, const zone *zone, yyjson_val *manifest) {
+    yyjson_val *collection;
+    yyjson_val *value;
+    size_t index;
+    size_t count;
+
+    if (!desired || !zone || !yyjson_is_obj(manifest)) {
+        return 0;
+    }
+    collection = yyjson_obj_get(manifest, "dns_records");
+    if (collection && !yyjson_is_arr(collection)) {
+        return 0;
+    }
+    yyjson_arr_foreach(collection, index, count, value) {
+        if (!yyjson_is_obj(value) || !add_desired_record_json(desired, zone, value)) {
+            return 0;
+        }
+    }
+    collection = yyjson_obj_get(yyjson_obj_get(manifest, "workers"), "routes");
+    if (collection && !yyjson_is_arr(collection)) {
+        return 0;
+    }
+    yyjson_arr_foreach(collection, index, count, value) {
+        if (!yyjson_is_obj(value) || !add_desired_route_json(desired, zone, value)) {
+            return 0;
+        }
+    }
+    value = yyjson_obj_get(yyjson_obj_get(yyjson_obj_get(manifest, "rulesets"), "phases"), "http_request_dynamic_redirect");
+    if (value && (!yyjson_is_obj(value) || !add_desired_redirect_json(desired, zone, value))) {
+        return 0;
+    }
+    value = yyjson_obj_get(yyjson_obj_get(yyjson_obj_get(manifest, "email_routing"), "rules"), "catch_all");
+    if (value && (!yyjson_is_obj(value) || !add_desired_email_routing_json(desired, zone, value))) {
+        return 0;
+    }
+    value = yyjson_obj_get(manifest, "dnssec");
+    return !value || (yyjson_is_obj(value) && add_desired_dnssec_json(desired, zone, value));
+}
+
+static int add_setting(resources::set *collection, const zone *zone, const char *identifier, yyjson_val *setting) {
+    char path[4096];
+
+    if (!identifier || !setting || strlen(zone->name) + strlen(identifier) + sizeof("zones//settings/") > sizeof(path)) {
+        return 0;
+    }
+    sprintf(path, "zones/%s/settings/%s", zone->name, identifier);
+    return resources::add_json_resource(collection, path, resources::ZONE_SETTING, identifier, setting);
+}
+
+export int fetch_declared_settings(const zone *zone, yyjson_val *settings, resources::set *remote, resources::set *desired) {
+    const char *identifier;
+    char endpoint[512];
+    yyjson_doc *document;
+    yyjson_val *declared;
+    yyjson_val *key;
+    yyjson_val *remote_setting;
+    size_t index;
+    size_t count;
+
+    if (!settings) {
+        return 1;
+    }
+    if (!yyjson_is_obj(settings)) {
+        return 0;
+    }
+    yyjson_obj_foreach(settings, index, count, key, declared) {
+        identifier = yyjson_get_str(key);
+        if (!identifier || !yyjson_is_obj(declared) || !yyjson_obj_get(declared, "value") || strlen(zone->id) + strlen(identifier) + sizeof("zones//settings/") > sizeof(endpoint)) {
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/settings/%s", zone->id, identifier);
+        if (!request("GET", endpoint, NULL, &document, &remote_setting)) {
+            return 0;
+        }
+        if (!yyjson_obj_get(remote_setting, "value") || !add_setting(remote, zone, identifier, remote_setting) || !add_setting(desired, zone, identifier, declared)) {
+            yyjson_doc_free(document);
+            return 0;
+        }
+        yyjson_doc_free(document);
+    }
+    return 1;
+}
+
+export int add_declared_zone(const zone *zone, yyjson_val *declaration, resources::set *remote, resources::set *desired) {
+    int has_email_routing;
+    int has_redirect_ruleset;
+    int has_routes;
+
+    if (!zone || !yyjson_is_obj(declaration)) {
+        return 0;
+    }
+    has_email_routing = yyjson_obj_get(yyjson_obj_get(yyjson_obj_get(declaration, "email_routing"), "rules"), "catch_all") != NULL;
+    has_routes = yyjson_obj_get(yyjson_obj_get(declaration, "workers"), "routes") != NULL;
+    has_redirect_ruleset = yyjson_obj_get(yyjson_obj_get(yyjson_obj_get(declaration, "rulesets"), "phases"), "http_request_dynamic_redirect") != NULL;
+    return add_declared_resources(desired, zone, declaration) && fetch_declared_settings(zone, yyjson_obj_get(declaration, "settings"), remote, desired) &&
+           (!has_email_routing || fetch_email_routing(zone, remote)) &&
+           (!yyjson_obj_get(declaration, "dns_records") || fetch_records(zone, remote, desired)) &&
+           (!has_routes || fetch_routes(zone, remote, desired)) && (!has_redirect_ruleset || fetch_redirects(zone, remote)) &&
+           (!yyjson_obj_get(declaration, "dnssec") || fetch_dnssec(zone, remote));
+}
+
+export int add_declared(yyjson_val *declaration, zones *account_zones, resources::set *remote, resources::set *desired) {
+    yyjson_val *domains;
+    yyjson_val *pages;
+    yyjson_val *scripts;
+    yyjson_val *workers;
+    yyjson_val *zone_declaration;
+    yyjson_val *zone_declarations;
+    size_t index;
+    size_t matched_zones;
+
+    zone_declarations = yyjson_obj_get(declaration, "zones");
+    if (!yyjson_is_obj(declaration) || !yyjson_is_obj(zone_declarations) || !fetch_zones(account_zones)) {
+        return 0;
+    }
+    workers = yyjson_obj_get(declaration, "workers");
+    scripts = yyjson_obj_get(workers, "scripts");
+    domains = yyjson_obj_get(workers, "domains");
+    pages = yyjson_obj_get(declaration, "pages");
+    if ((domains && !add_declared_worker_domains(desired, domains)) || (pages && !add_declared_pages(desired, pages)) ||
+        (scripts && !fetch_declared_workers(scripts, remote, desired)) || (pages && !fetch_page_domains(pages, remote, desired)) ||
+        (domains && !fetch_worker_domains(remote, desired))) {
+        return 0;
+    }
+    matched_zones = 0;
+    for (index = 0; index < account_zones->count; ++index) {
+        zone_declaration = yyjson_obj_get(zone_declarations, account_zones->items[index].name);
+        if (zone_declaration) {
+            ++matched_zones;
+            if (!add_declared_zone(&account_zones->items[index], zone_declaration, remote, desired)) {
+                return 0;
+            }
+        }
+    }
+    if (matched_zones != yyjson_obj_size(zone_declarations)) {
+        memcpy(last_error, "declared zone not found", sizeof("declared zone not found"));
+        return 0;
+    }
+    return 1;
+}
+
+static const zone *zone_for_path(const zones *zones, const char *path) {
+    const char *name;
+    const char *slash;
+    size_t index;
+    size_t length;
+
+    if (strncmp(path, "zones/", 6) != 0) {
+        return NULL;
+    }
+    name = path + 6;
+    slash = strchr(name, '/');
+    if (!slash) {
+        return NULL;
+    }
+    length = (size_t)(slash - name);
+    for (index = 0; index < zones->count; ++index) {
+        if (strlen(zones->items[index].name) == length && strncmp(zones->items[index].name, name, length) == 0) {
+            return &zones->items[index];
+        }
+    }
+    return NULL;
+}
+
+static int execute(const char *method, const char *endpoint, const char *body) {
+    yyjson_doc *document;
+    yyjson_val *result;
+
+    if (!request(method, endpoint, body, &document, &result)) {
+        return 0;
+    }
+    yyjson_doc_free(document);
+    return 1;
+}
+
+static int remove_record(const zone *zone, const char *identifier) {
+    char endpoint[4096];
+
+    if (!identifier || strlen(zone->id) + strlen(identifier) + sizeof("zones//dns_records/") > sizeof(endpoint)) {
+        return 0;
+    }
+    sprintf(endpoint, "zones/%s/dns_records/%s", zone->id, identifier);
+    if (execute("DELETE", endpoint, NULL) || missing()) {
+        return 1;
+    }
+    if (!conflict()) {
+        return 0;
+    }
+    if (strlen(zone->id) + sizeof("zones//email/routing/disable") > sizeof(endpoint)) {
+        return 0;
+    }
+    sprintf(endpoint, "zones/%s/email/routing/disable", zone->id);
+    if (!execute("POST", endpoint, "{}") && !conflict()) {
+        return 0;
+    }
+    sprintf(endpoint, "zones/%s/dns_records/%s", zone->id, identifier);
+    return execute("DELETE", endpoint, NULL) || missing();
+}
+
+static int write_ruleset(const zone *zone, const resources::resource *resource, int remove) {
+    char endpoint[4096];
+    char *body;
+    int success;
+
+    if (remove) {
+        if (!resource->identifier ||
+            strlen(zone->id) + strlen(resource->identifier) + sizeof("zones//rulesets/") > sizeof(endpoint)) {
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/rulesets/%s", zone->id, resource->identifier);
+        return execute("DELETE", endpoint, NULL);
+    }
+    if (strlen(zone->id) + sizeof("zones//rulesets") > sizeof(endpoint)) {
+        return 0;
+    }
+    body = resource->json ? yyjson_val_write(resource->json, 0, NULL) : NULL;
+    if (!body) {
+        return 0;
+    }
+    sprintf(endpoint, "zones/%s/rulesets", zone->id);
+    success = execute("POST", endpoint, body);
+    free(body);
+    return success;
+}
+
+static int update_ruleset(const zone *zone, const resources::resource *remote, const resources::resource *desired) {
+    char endpoint[4096];
+    char *body;
+    int success;
+
+    if (!remote->identifier || !desired->json ||
+        strlen(zone->id) + strlen(remote->identifier) + sizeof("zones//rulesets/") > sizeof(endpoint)) {
+        return 0;
+    }
+    body = yyjson_val_write(desired->json, 0, NULL);
+    if (!body) {
+        return 0;
+    }
+    sprintf(endpoint, "zones/%s/rulesets/%s", zone->id, remote->identifier);
+    success = execute("PUT", endpoint, body);
+    free(body);
+    return success;
+}
+static char *resource_body(const resources::resource *resource) {
+    return resource && resource->json ? yyjson_val_write(resource->json, 0, NULL) : NULL;
+}
+
+static int push_resource(const resources::resource *resource, const zones *zones) {
+    const char *hostname;
+    const char *project;
+    const zone *zone;
+    char endpoint[4096];
+    char *body;
+    int success;
+
+    if (!resource || !resource->path) {
+        return 0;
+    }
+    body = resource_body(resource);
+    if (!body) {
+        return 0;
+    }
+    zone = zone_for_path(zones, resource->path);
+    if (zone && resource->type == resources::RULESET) {
+        free(body);
+        return write_ruleset(zone, resource, 0);
+    }
+    if (zone && resource->type == resources::ZONE_SETTING) {
+        if (!resource->identifier || strlen(zone->id) + strlen(resource->identifier) + sizeof("zones//settings/") > sizeof(endpoint)) {
+            free(body);
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/settings/%s", zone->id, resource->identifier);
+        success = execute("PATCH", endpoint, body);
+    } else if (zone && resource->type == resources::DNSSEC) {
+        if (strlen(zone->id) + sizeof("zones//dnssec") > sizeof(endpoint)) {
+            free(body);
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/dnssec", zone->id);
+        success = execute("PATCH", endpoint, body);
+    } else if (zone && resource->type == resources::DNS_RECORD) {
+        if (strlen(zone->id) + sizeof("zones//dns_records") > sizeof(endpoint)) {
+            free(body);
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/dns_records", zone->id);
+        success = execute("POST", endpoint, body);
+    } else if (zone && resource->type == resources::WORKER_ROUTE) {
+        if (strlen(zone->id) + sizeof("zones//workers/routes") > sizeof(endpoint)) {
+            free(body);
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/workers/routes", zone->id);
+        success = execute("POST", endpoint, body);
+    } else if (zone && resource->type == resources::EMAIL_ROUTING) {
+        if (strlen(zone->id) + sizeof("zones//email/routing/rules/catch_all") > sizeof(endpoint)) {
+            free(body);
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/email/routing/enable", zone->id);
+        success = execute("POST", endpoint, "{}") || conflict();
+        if (success) {
+            sprintf(endpoint, "zones/%s/email/routing/rules/catch_all", zone->id);
+            success = execute("PUT", endpoint, body);
+        }
+    } else if (resource->type == resources::WORKER_SETTING) {
+        if (!account_id || !resource->identifier ||
+            strlen(account_id) + strlen(resource->identifier) + sizeof("accounts//workers/scripts//script-settings") > sizeof(endpoint)) {
+            free(body);
+            return 0;
+        }
+        sprintf(endpoint, "accounts/%s/workers/scripts/%s/script-settings", account_id, resource->identifier);
+        success = execute("PATCH", endpoint, body);
+    } else if (resource->type == resources::PAGE_DOMAIN) {
+        project = resource->path + strlen("page_domains/");
+        hostname = strchr(project, '/');
+        if (!account_id || strncmp(resource->path, "page_domains/", strlen("page_domains/")) != 0 || !hostname ||
+            strlen(account_id) + (size_t)(hostname - project) + sizeof("accounts//pages/projects//domains") > sizeof(endpoint)) {
+            free(body);
+            return 0;
+        }
+        sprintf(endpoint, "accounts/%s/pages/projects/%.*s/domains", account_id, (int)(hostname - project), project);
+        success = execute("POST", endpoint, body);
+    } else if (resource->type == resources::WORKER_DOMAIN) {
+        if (!account_id || strlen(account_id) + sizeof("accounts//workers/domains") > sizeof(endpoint)) {
+            free(body);
+            return 0;
+        }
+        sprintf(endpoint, "accounts/%s/workers/domains", account_id);
+        success = execute("PUT", endpoint, body);
+    } else {
+        success = 0;
+    }
+    free(body);
+    return success;
+}
+
+static int remove_resource(const resources::resource *resource, const zones *zones) {
+    const zone *zone;
+    char endpoint[4096];
+
+    if (!resource || !resource->path) {
+        return 0;
+    }
+    if (resource->type == resources::WORKER_SETTING || resource->type == resources::WORKER_DOMAIN || resource->type == resources::PAGE_DOMAIN) {
+        memcpy(last_error, "resource removal is not supported", sizeof("resource removal is not supported"));
+        return 0;
+    }
+    zone = zone_for_path(zones, resource->path);
+    if (zone && resource->type == resources::RULESET) {
+        return write_ruleset(zone, resource, 1);
+    }
+    if (zone && (resource->type == resources::DNSSEC || resource->type == resources::ZONE_SETTING)) {
+        return 1;
+    }
+    if (zone && resource->type == resources::DNS_RECORD) {
+        return remove_record(zone, resource->identifier);
+    } else if (zone && resource->type == resources::WORKER_ROUTE) {
+        if (!resource->identifier || strlen(zone->id) + strlen(resource->identifier) + sizeof("zones//workers/routes/") > sizeof(endpoint)) {
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/workers/routes/%s", zone->id, resource->identifier);
+    } else if (zone && resource->type == resources::EMAIL_ROUTING) {
+        if (strlen(zone->id) + sizeof("zones//email/routing/disable") > sizeof(endpoint)) {
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/email/routing/disable", zone->id);
+        return execute("POST", endpoint, "{}") || conflict();
+    } else {
+        return 0;
+    }
+    return execute("DELETE", endpoint, NULL);
+}
+
+static int update_identified_resource(const resources::resource *remote, const resources::resource *desired, const zones *zones) {
+    const char *method;
+    const zone *zone;
+    char endpoint[4096];
+    char *body;
+    int success;
+
+    if (!remote->identifier || !desired->json) {
+        return 0;
+    }
+    zone = zone_for_path(zones, remote->path);
+    if (zone && remote->type == resources::DNS_RECORD) {
+        if (strlen(zone->id) + strlen(remote->identifier) + sizeof("zones//dns_records/") > sizeof(endpoint)) {
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/dns_records/%s", zone->id, remote->identifier);
+        method = "PATCH";
+    } else if (zone && remote->type == resources::WORKER_ROUTE) {
+        if (strlen(zone->id) + strlen(remote->identifier) + sizeof("zones//workers/routes/") > sizeof(endpoint)) {
+            return 0;
+        }
+        sprintf(endpoint, "zones/%s/workers/routes/%s", zone->id, remote->identifier);
+        method = "PUT";
+    } else if (remote->type == resources::WORKER_DOMAIN) {
+        if (!account_id || strlen(account_id) + strlen(remote->identifier) + sizeof("accounts//workers/domains/") > sizeof(endpoint)) {
+            return 0;
+        }
+        sprintf(endpoint, "accounts/%s/workers/domains/%s", account_id, remote->identifier);
+        method = "PUT";
+    } else {
+        return push_resource(desired, zones);
+    }
+    body = yyjson_val_write(desired->json, 0, NULL);
+    if (!body) {
+        return 0;
+    }
+    success = execute(method, endpoint, body);
+    free(body);
+    return success;
+}
+
+export int apply(const resources::diff *diff, const zones *zones) {
+    const zone *zone;
+
+    if (diff->action == resources::REMOVE) {
+        return diff->remote && remove_resource(diff->remote, zones);
+    }
+    if (diff->action == resources::PUSH) {
+        return diff->desired && push_resource(diff->desired, zones);
+    }
+    if (diff->remote && diff->desired && diff->remote->type == resources::RULESET) {
+        zone = zone_for_path(zones, diff->remote->path);
+        return zone && update_ruleset(zone, diff->remote, diff->desired);
+    }
+    return diff->remote && diff->desired && update_identified_resource(diff->remote, diff->desired, zones);
+}
+
+}

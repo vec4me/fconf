@@ -1,0 +1,303 @@
+module;
+
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <yyjson.h>
+
+export module resources;
+
+namespace resources {
+
+export typedef enum action {
+    REMOVE,
+    PUSH,
+    UPDATE
+} action;
+
+export typedef enum type {
+    PAGE_DOMAIN,
+    WORKER_DOMAIN,
+    DNSSEC,
+    WORKER_ROUTE,
+    RULESET,
+    EMAIL_ROUTING,
+    DNS_RECORD,
+    ZONE_SETTING,
+    WORKER_SETTING,
+    REGERY_DOMAIN,
+    TELNYX_PROFILE
+} type;
+
+export typedef struct resource {
+    char *path;
+    char *identifier;
+    type type;
+    yyjson_doc *document;
+    yyjson_val *json;
+} resource;
+
+export typedef struct set {
+    resource *items;
+    size_t count;
+} set;
+
+export typedef struct diff {
+    action action;
+    const resource *remote;
+    const resource *desired;
+} diff;
+
+export typedef struct changes {
+    diff *items;
+    size_t count;
+} changes;
+
+static const resource *find(const resource *items, size_t count, const char *path) {
+    size_t index;
+
+    for (index = 0; index < count; ++index) {
+        if (strcmp(items[index].path, path) == 0) {
+            return &items[index];
+        }
+    }
+    return NULL;
+}
+
+static char *copy(const char *text) {
+    char *result;
+    size_t length;
+
+    length = strlen(text);
+    result = (char *)malloc(length + 1);
+    if (result) {
+        memcpy(result, text, length + 1);
+    }
+    return result;
+}
+
+export void init(set *resources) {
+    resources->items = NULL;
+    resources->count = 0;
+}
+
+static void release_value(resource *resource) {
+    yyjson_doc_free(resource->document);
+}
+
+export int add_json_resource(set *resources, const char *path, type resource_type, const char *identifier, yyjson_val *value) {
+    resource *items;
+    char *owned_identifier;
+    char *owned_path;
+    yyjson_doc *document;
+    yyjson_mut_doc *mutable_document;
+    yyjson_mut_val *copy_value;
+    size_t index;
+
+    mutable_document = yyjson_mut_doc_new(NULL);
+    copy_value = mutable_document ? yyjson_val_mut_copy(mutable_document, value) : NULL;
+    if (copy_value) {
+        yyjson_mut_doc_set_root(mutable_document, copy_value);
+    }
+    document = copy_value ? yyjson_mut_doc_imut_copy(mutable_document, NULL) : NULL;
+    yyjson_mut_doc_free(mutable_document);
+    owned_path = copy(path);
+    owned_identifier = identifier ? copy(identifier) : NULL;
+    if (!document || !owned_path || (identifier && !owned_identifier)) {
+        yyjson_doc_free(document);
+        free(owned_identifier);
+        free(owned_path);
+        return 0;
+    }
+    for (index = 0; index < resources->count; ++index) {
+        if (strcmp(resources->items[index].path, path) == 0) {
+            free(resources->items[index].path);
+            free(resources->items[index].identifier);
+            release_value(&resources->items[index]);
+            memset(&resources->items[index], 0, sizeof(resources->items[index]));
+            resources->items[index].path = owned_path;
+            resources->items[index].identifier = owned_identifier;
+            resources->items[index].type = resource_type;
+            resources->items[index].document = document;
+            resources->items[index].json = yyjson_doc_get_root(document);
+            return 1;
+        }
+    }
+    items = (resource *)realloc(resources->items, (resources->count + 1) * sizeof(*items));
+    if (!items) {
+        yyjson_doc_free(document);
+        free(owned_identifier);
+        free(owned_path);
+        return 0;
+    }
+    resources->items = items;
+    memset(&resources->items[resources->count], 0, sizeof(resources->items[resources->count]));
+    resources->items[resources->count].path = owned_path;
+    resources->items[resources->count].identifier = owned_identifier;
+    resources->items[resources->count].type = resource_type;
+    resources->items[resources->count].document = document;
+    resources->items[resources->count].json = yyjson_doc_get_root(document);
+    ++resources->count;
+    return 1;
+}
+
+export int contains_path(const set *resources, const char *path, type resource_type) {
+    const resource *item;
+
+    item = resources && path ? find(resources->items, resources->count, path) : NULL;
+    return item && item->type == resource_type;
+}
+
+export void release(set *resources) {
+    size_t index;
+
+    for (index = 0; index < resources->count; ++index) {
+        free(resources->items[index].path);
+        free(resources->items[index].identifier);
+        release_value(&resources->items[index]);
+    }
+    free(resources->items);
+    resources->items = NULL;
+    resources->count = 0;
+}
+
+static int matches_json(yyjson_val *actual, yyjson_val *declared) {
+    unsigned char *matched;
+    yyjson_val *key;
+    yyjson_val *value;
+    size_t actual_count;
+    size_t actual_index;
+    size_t index;
+    size_t count;
+
+    if (yyjson_is_arr(declared)) {
+        if (!yyjson_is_arr(actual)) {
+            return 0;
+        }
+        actual_count = yyjson_arr_size(actual);
+        if (actual_count < yyjson_arr_size(declared)) {
+            return 0;
+        }
+        count = yyjson_arr_size(declared);
+        matched = actual_count ? (unsigned char *)calloc(actual_count, sizeof(*matched)) : NULL;
+        if (actual_count && !matched) {
+            return 0;
+        }
+        for (index = 0; index < count; ++index) {
+            for (actual_index = 0; actual_index < actual_count; ++actual_index) {
+                if (!matched[actual_index] && matches_json(yyjson_arr_get(actual, actual_index), yyjson_arr_get(declared, index))) {
+                    matched[actual_index] = 1;
+                    break;
+                }
+            }
+            if (actual_index == actual_count) {
+                free(matched);
+                return 0;
+            }
+        }
+        free(matched);
+        return 1;
+    }
+    if (!yyjson_is_obj(declared)) {
+        return yyjson_equals(actual, declared);
+    }
+    if (!yyjson_is_obj(actual)) {
+        return 0;
+    }
+    yyjson_obj_foreach(declared, index, count, key, value) {
+        if (!matches_json(yyjson_obj_get(actual, yyjson_get_str(key)), value)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int equal(const resource *left, const resource *right) {
+    if (left->type != right->type) {
+        return 0;
+    }
+    return left->json && right->json && matches_json(left->json, right->json);
+}
+
+static int append(diff *diffs, size_t capacity, size_t *count, action action, const resource *remote, const resource *desired) {
+    if (*count >= capacity) {
+        return 0;
+    }
+    diffs[*count].action = action;
+    diffs[*count].remote = remote;
+    diffs[*count].desired = desired;
+    ++*count;
+    return 1;
+}
+
+static int plan(const resource *remote, size_t remote_count, const resource *desired, size_t desired_count, diff *diffs, size_t capacity, size_t *count) {
+    const resource *match;
+    size_t index;
+
+    *count = 0;
+    for (index = 0; index < remote_count; ++index) {
+        match = find(desired, desired_count, remote[index].path);
+        if (!match && !append(diffs, capacity, count, REMOVE, &remote[index], NULL)) {
+            return 0;
+        }
+    }
+    for (index = 0; index < desired_count; ++index) {
+        match = find(remote, remote_count, desired[index].path);
+        if (!match) {
+            if (!append(diffs, capacity, count, PUSH, NULL, &desired[index])) {
+                return 0;
+            }
+        } else if (!equal(match, &desired[index]) && !append(diffs, capacity, count, UPDATE, match, &desired[index])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+export void init_changes(changes *result) {
+    result->items = NULL;
+    result->count = 0;
+}
+
+export int calculate(const set *remote, const set *desired, changes *result) {
+    size_t capacity;
+
+    free(result->items);
+    result->items = NULL;
+    result->count = 0;
+    if (remote->count > (size_t)-1 - desired->count) {
+        return 0;
+    }
+    capacity = remote->count + desired->count;
+    if (!capacity) {
+        return 1;
+    }
+    result->items = (diff *)malloc(capacity * sizeof(*result->items));
+    if (!result->items) {
+        return 0;
+    }
+    if (!plan(remote->items, remote->count, desired->items, desired->count, result->items, capacity, &result->count)) {
+        free(result->items);
+        result->items = NULL;
+        result->count = 0;
+        return 0;
+    }
+    return 1;
+}
+
+export const char *action_name(action action) {
+    if (action == REMOVE) {
+        return "remove";
+    }
+    if (action == PUSH) {
+        return "push";
+    }
+    return "update";
+}
+
+export void release_changes(changes *result) {
+    free(result->items);
+    init_changes(result);
+}
+
+}

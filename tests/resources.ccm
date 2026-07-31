@@ -1,0 +1,119 @@
+#if 0
+error() {
+    echo "$*" >&2
+    exit 1
+}
+
+sh tools/build-lib.sh || error "could not build Functional Configurator library"
+mkdir -p build || error "could not create build directory"
+clang \
+    -fprebuilt-module-path=build \
+    -std=c++20 \
+    -g \
+    -Os \
+    -x c++ \
+    -c "$0" \
+    -o build/resources-test.o || error "could not build resource test"
+clang \
+    -fprebuilt-module-path=build \
+    -std=c++20 \
+    -g \
+    -Os \
+    build/resources-test.o \
+    build/resources.o \
+    -lyyjson \
+    -o build/resources-test || error "could not link resource test"
+build/resources-test || error "resource test failed"
+exit 0
+#endif
+
+import resources;
+
+#include <stdio.h>
+#include <string.h>
+#include <yyjson.h>
+
+int main(void) {
+    resources::changes changes;
+    resources::set desired;
+    resources::set telnyx_desired;
+    resources::set telnyx_remote;
+    resources::set remote;
+    resources::set worker_desired;
+    resources::set worker_remote;
+    yyjson_doc *desired_settings;
+    yyjson_doc *record;
+    yyjson_doc *changed_record;
+    yyjson_doc *telnyx_declared;
+    yyjson_doc *telnyx_state;
+    yyjson_doc *remote_settings;
+    int success;
+
+    resources::init(&remote);
+    resources::init(&desired);
+    resources::init(&telnyx_desired);
+    resources::init(&telnyx_remote);
+    resources::init(&worker_desired);
+    resources::init(&worker_remote);
+    resources::init_changes(&changes);
+    record = yyjson_read("{\"name\":\"example\",\"type\":\"A\",\"content\":\"192.0.2.1\",\"ttl\":1,\"id\":\"remote-id\"}",
+                         strlen("{\"name\":\"example\",\"type\":\"A\",\"content\":\"192.0.2.1\",\"ttl\":1,\"id\":\"remote-id\"}"), 0);
+    changed_record = yyjson_read("{\"name\":\"example\",\"type\":\"A\",\"content\":\"192.0.2.2\",\"ttl\":1}",
+                                 strlen("{\"name\":\"example\",\"type\":\"A\",\"content\":\"192.0.2.2\",\"ttl\":1}"), 0);
+    success = record && changed_record && resources::add_json_resource(&remote, "zones/example/records/root", resources::DNS_RECORD, "remote-id", yyjson_doc_get_root(record)) &&
+              resources::add_json_resource(&desired, "zones/example/records/root", resources::DNS_RECORD, NULL, yyjson_doc_get_root(record)) &&
+              resources::calculate(&remote, &desired, &changes) && changes.count == 0;
+
+    resources::release(&desired);
+    resources::init(&desired);
+    success = success && resources::add_json_resource(&desired, "zones/example/records/root", resources::DNS_RECORD, NULL, yyjson_doc_get_root(changed_record)) &&
+              resources::add_json_resource(&desired, "zones/example/records/new", resources::DNS_RECORD, NULL, yyjson_doc_get_root(record)) &&
+              resources::calculate(&remote, &desired, &changes) && changes.count == 2 && changes.items[0].action == resources::UPDATE && changes.items[1].action == resources::PUSH &&
+              strcmp(changes.items[0].remote->identifier, "remote-id") == 0;
+    yyjson_doc_free(changed_record);
+    yyjson_doc_free(record);
+
+    resources::release(&desired);
+    resources::init(&desired);
+    success = success && resources::calculate(&remote, &desired, &changes) && changes.count == 1 && changes.items[0].action == resources::REMOVE &&
+              strcmp(changes.items[0].remote->identifier, "remote-id") == 0;
+    resources::release(&telnyx_remote);
+    resources::release(&telnyx_desired);
+    resources::init(&telnyx_remote);
+    resources::init(&telnyx_desired);
+    telnyx_state = yyjson_read(
+        "{\"messaging_profiles\":[{\"id\":\"msg-id\",\"name\":\"main\",\"created_at\":\"server\"}],\"outbound_voice_profiles\":[],\"credential_connections\":[],\"phone_numbers\":[{\"id\":\"phone-id\",\"phone_number\":\"+12025550123\",\"external_pin\":\"1234\",\"status\":\"active\",\"voice\":{\"id\":\"phone-id\",\"connection_id\":\"connection-id\"}}],\"messaging_phone_numbers\":[{\"phone_number\":\"+12025550123\",\"messaging_profile_id\":\"msg-id\"}]}",
+        strlen("{\"messaging_profiles\":[{\"id\":\"msg-id\",\"name\":\"main\",\"created_at\":\"server\"}],\"outbound_voice_profiles\":[],\"credential_connections\":[],\"phone_numbers\":[{\"id\":\"phone-id\",\"phone_number\":\"+12025550123\",\"external_pin\":\"1234\",\"status\":\"active\",\"voice\":{\"id\":\"phone-id\",\"connection_id\":\"connection-id\"}}],\"messaging_phone_numbers\":[{\"phone_number\":\"+12025550123\",\"messaging_profile_id\":\"msg-id\"}]}"), 0);
+    telnyx_declared = yyjson_read(
+        "{\"messaging_profiles\":[{\"name\":\"main\"}],\"outbound_voice_profiles\":[],\"credential_connections\":[],\"phone_numbers\":[{\"phone_number\":\"+12025550123\",\"external_pin\":\"1234\",\"voice\":{\"connection_id\":\"connection-id\"}}],\"messaging_phone_numbers\":[{\"phone_number\":\"+12025550123\",\"messaging_profile_id\":\"msg-id\"}]}",
+        strlen("{\"messaging_profiles\":[{\"name\":\"main\"}],\"outbound_voice_profiles\":[],\"credential_connections\":[],\"phone_numbers\":[{\"phone_number\":\"+12025550123\",\"external_pin\":\"1234\",\"voice\":{\"connection_id\":\"connection-id\"}}],\"messaging_phone_numbers\":[{\"phone_number\":\"+12025550123\",\"messaging_profile_id\":\"msg-id\"}]}"), 0);
+    success = success && telnyx_state && telnyx_declared &&
+              resources::add_json_resource(&telnyx_remote, "telnyx/profiles", resources::TELNYX_PROFILE, NULL, yyjson_doc_get_root(telnyx_state)) &&
+              resources::add_json_resource(&telnyx_desired, "telnyx/profiles", resources::TELNYX_PROFILE, NULL, yyjson_doc_get_root(telnyx_declared)) &&
+              resources::calculate(&telnyx_remote, &telnyx_desired, &changes) && changes.count == 0;
+    yyjson_doc_free(telnyx_declared);
+    yyjson_doc_free(telnyx_state);
+    remote_settings = yyjson_read("{\"logpush\":false,\"bindings\":[{\"name\":\"TOKEN\",\"type\":\"secret_text\",\"text\":\"secret\",\"version\":\"server-owned\"}],\"created_on\":\"server-owned\"}",
+                                  strlen("{\"logpush\":false,\"bindings\":[{\"name\":\"TOKEN\",\"type\":\"secret_text\",\"text\":\"secret\",\"version\":\"server-owned\"}],\"created_on\":\"server-owned\"}"), 0);
+    desired_settings = yyjson_read("{\"logpush\":false,\"bindings\":[{\"name\":\"TOKEN\",\"type\":\"secret_text\",\"text\":\"secret\"}]}",
+                                   strlen("{\"logpush\":false,\"bindings\":[{\"name\":\"TOKEN\",\"type\":\"secret_text\",\"text\":\"secret\"}]}"), 0);
+    success = success && remote_settings && desired_settings &&
+              resources::add_json_resource(&worker_remote, "workers/example/script-settings", resources::WORKER_SETTING, NULL, yyjson_doc_get_root(remote_settings)) &&
+              resources::add_json_resource(&worker_desired, "workers/example/script-settings", resources::WORKER_SETTING, NULL, yyjson_doc_get_root(desired_settings)) &&
+              resources::calculate(&worker_remote, &worker_desired, &changes) && changes.count == 0;
+    yyjson_doc_free(desired_settings);
+    yyjson_doc_free(remote_settings);
+
+    resources::release_changes(&changes);
+    resources::release(&telnyx_desired);
+    resources::release(&telnyx_remote);
+    resources::release(&worker_desired);
+    resources::release(&worker_remote);
+    resources::release(&desired);
+    resources::release(&remote);
+    if (!success) {
+        return 1;
+    }
+    puts("resource identity and semantic divergence match");
+    return 0;
+}
