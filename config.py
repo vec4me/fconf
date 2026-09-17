@@ -1,4 +1,4 @@
-"""CLI entry point for managing Cloudflare, SES, Telnyx, and Regery infrastructure."""
+"""CLI entry point for managing Cloudflare, Telnyx, and Regery infrastructure."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Any, Final, Literal, TypedDict, cast
 import cloudflare
 import provider
 import regery
-import ses
 import telnyx
 from cloudflare import Zone
 from provider import ConfigTree
@@ -158,14 +157,12 @@ def configure_cf_email(
     local: ConfigTree,
     zone: Zone,
     forward_to: str,
-    dkim_tokens: dict[str, list[str]] | None,
     mx_priorities: dict[str, int],
 ) -> None:
-    """Configure Cloudflare Email Routing and SES outbound DNS for a zone."""
+    """Configure Cloudflare Email Routing and Email Sending for a zone."""
     name = str(zone["name"])
     is_icloud = get_config(zone, "icloud_mail") is not None
-
-    spf_includes = "include:_spf.mx.cloudflare.net include:amazonses.com"
+    spf_includes = "include:_spf.mx.cloudflare.net"
     if is_icloud:
         spf_includes += " include:icloud.com"
     cloudflare.make_record(local, zone, "@", "TXT", f"v=spf1 {spf_includes} ~all")
@@ -188,14 +185,6 @@ def configure_cf_email(
     # Cloudflare Email Routing DKIM
     cloudflare.make_record(local, zone, "cf2024-1._domainkey", "TXT", CF_DKIM_RECORD)
 
-    # SES outbound DKIM
-    if dkim_tokens and name in dkim_tokens:
-        for token in dkim_tokens[name]:
-            cloudflare.make_record(
-                local, zone, f"{token}._domainkey", "CNAME",
-                f"{token}.dkim.amazonses.com", proxied=False,
-            )
-
     # iCloud DKIM
     if is_icloud:
         cloudflare.make_record(
@@ -203,6 +192,7 @@ def configure_cf_email(
             f"sig1.dkim.{name}.at.icloudmailadmin.com", proxied=False,
         )
 
+    cloudflare.make_email_sending_subdomain(local, zone, name)
     cloudflare.make_email_routing_catch_all(local, zone, forward_to=forward_to)
 
 
@@ -219,7 +209,6 @@ def configure_google_email(local: ConfigTree, zone: Zone) -> None:
 def configure_email(
     local: ConfigTree,
     zone: Zone,
-    dkim_tokens: dict[str, list[str]] | None = None,
     forward_to: str | None = None,
     mx_priorities: dict[str, int] | None = None,
 ) -> None:
@@ -235,7 +224,7 @@ def configure_email(
     if mx_priorities is None:
         msg = f"MX priorities must be set for email routing domain {zone['name']}"
         raise ValueError(msg)
-    configure_cf_email(local, zone, forward_to, dkim_tokens, mx_priorities)
+    configure_cf_email(local, zone, forward_to, mx_priorities)
 
 
 # DNS
@@ -266,8 +255,9 @@ def configure_dns(
 
     cloudflare.make_record(local, zone, "_dmarc", "TXT", "v=DMARC1; p=quarantine;")
 
-    cloudflare.make_record(local, zone, "mail", "CNAME", "mail.vec4me.workers.dev")
-    cloudflare.make_route(local, zone, f"mail.{zone['name']}/unsubscribe*", "mail")
+    if "mail" in workers:
+        cloudflare.make_record(local, zone, "mail", "CNAME", "mail.vec4me.workers.dev")
+        cloudflare.make_route(local, zone, f"mail.{zone['name']}/unsubscribe*", "mail")
 
     api_worker = find_api_worker(workers, zone)
     if api_worker:
@@ -439,21 +429,7 @@ def configure_regery(
         )
 
 
-# SES
-
-def configure_ses(
-    local: ConfigTree,
-    domains: list[str],
-) -> None:
-    """Configure SES outbound infrastructure (identities + SMTP users)."""
-    for domain in domains:
-        ses.make_identity(local, domain)
-        ses.make_smtp_user(local, domain)
-
-
-# ============================================================
 # Main
-# ============================================================
 
 DEFAULT_SETTINGS: Final[dict[str, object]] = {
     "0rtt": "on",
@@ -524,21 +500,9 @@ DEFAULT_SETTINGS: Final[dict[str, object]] = {
 }
 
 
-def run_ses_fetch(
-    aws_region: str | None,
-) -> tuple[ConfigTree, dict[str, list[str]]]:
-    """Initialize SES and fetch remote state. Returns (remote_tree, dkim_tokens)."""
-    if aws_region is None:
-        return {}, {}
-    ses.init(aws_region)
-    logger.info("=== SES ===")
-    return ses.fetch_all()
-
-
 def run_cloudflare(
     settings: dict[str, object],
     vps: str | None,
-    dkim_tokens: dict[str, list[str]],
     email_routing_domains: dict[str, str],
     zone_list: list[Zone] | None = None,
 ) -> dict[str, Zone]:
@@ -547,6 +511,9 @@ def run_cloudflare(
     used_services: set[str] = set()
 
     remote, zones, workers, pages = cloudflare.fetch_all(setting_ids=set(settings.keys()), zone_list=zone_list)
+
+    if "mail" in workers:
+        used_services.add("mail")
 
     local: ConfigTree = {}
     for zone in zones.values():
@@ -557,7 +524,7 @@ def run_cloudflare(
             if forward_to is not None
             else None
         )
-        configure_email(local, zone, dkim_tokens, forward_to, mx_priorities)
+        configure_email(local, zone, forward_to, mx_priorities)
         configure_dns(local, workers, zone, vps, hosting_type)
         configure_redirects(local, zone)
         configure_domains(local, workers, pages, zone, used_services, hosting_type)
@@ -575,26 +542,11 @@ def run_cloudflare(
     return zones
 
 
-def run_ses_apply(
-    ses_remote: ConfigTree,
-    ses_domains: list[str],
-) -> None:
-    """Run the SES declarative configuration."""
-    if not ses_domains:
-        return
-    logger.info("\n=== SES ===")
-    local: ConfigTree = {}
-    configure_ses(local, ses_domains)
-    provider.run_deltas(ses_remote, local)
-
-
 def main() -> None:
     """Run the full infrastructure configuration pipeline."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     vps = os.getenv("VPS")
-    aws_region = os.getenv("AWS_REGION")
-
     email_forwards: dict[str, str] = {
         "tattoocollectivereno.com": "tattoocollectivereno@gmail.com",
         "southtowntattoocollective.com": "tattoocollectivereno@gmail.com",
@@ -615,12 +567,8 @@ def main() -> None:
         if name not in google_domains:
             email_routing_domains[name] = email_forwards.get(name, email_default_forward)
 
-    ses_remote, dkim_tokens = run_ses_fetch(aws_region)
-    ses_domains = list(email_routing_domains.keys())
-
     cloudflare.ensure_destination_addresses(set(email_routing_domains.values()))
-    zones = run_cloudflare(DEFAULT_SETTINGS, vps, dkim_tokens, email_routing_domains, zone_list=zone_list)
-    run_ses_apply(ses_remote, ses_domains)
+    zones = run_cloudflare(DEFAULT_SETTINGS, vps, email_routing_domains, zone_list=zone_list)
 
     sip_password = os.getenv("SIP_PASSWORD", "")
 

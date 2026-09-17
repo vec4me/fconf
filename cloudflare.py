@@ -309,18 +309,7 @@ def remove_dns_record(zone_id: str, record_id: str | None) -> None:
         if "does not exist" in err:
             return
         if "managed by Email Routing" in err:
-            logger.info("disabling Email Routing to delete managed record %s", record_id)
-            try:
-                post(f"zones/{zone_id}/email/routing/disable", {})
-            except RuntimeError as disable_err:
-                if "already disabled" not in str(disable_err).lower():
-                    raise
-            # Record may have been auto-deleted when Email Routing was disabled
-            try:
-                delete(f"zones/{zone_id}/dns_records/{record_id}")
-            except RuntimeError as retry_err:
-                if "does not exist" not in str(retry_err):
-                    raise
+            logger.info("leaving Email Routing-managed record %s", record_id)
             return
         raise
 
@@ -641,6 +630,37 @@ def make_worker_domain(
     set_tree(tree, path, value, push, remove)
 
 
+def make_email_sending_subdomain(
+    tree: ConfigTree,
+    zone: Zone,
+    name: str | None = None,
+    *,
+    remote_data: dict[str, object] | None = None,
+) -> None:
+    """Build an Email Sending subdomain node in the config tree."""
+    zone_name = str(zone["name"])
+    zone_id = str(zone["id"])
+    subdomain_id: str | None = None
+
+    if remote_data:
+        name = str(remote_data["name"])
+        subdomain_id = str(remote_data["tag"])
+    elif name is None:
+        msg = f"{zone_name} email sending subdomain, missing name"
+        raise ValueError(msg)
+
+    value: dict[str, object] = {"name": name}
+
+    def push() -> None:
+        post(f"zones/{zone_id}/email/sending/subdomains", value)
+
+    def remove() -> None:
+        delete(f"zones/{zone_id}/email/sending/subdomains/{subdomain_id}")
+
+    path: Path = ("zones", zone_name, "email_sending_subdomains", str(name))
+    set_tree(tree, path, value, push, remove)
+
+
 def make_email_routing_catch_all(
     tree: ConfigTree,
     zone: Zone,
@@ -670,7 +690,7 @@ def make_email_routing_catch_all(
 
     def push() -> None:
         try:
-            post(f"zones/{zone_id}/email/routing/enable", {})
+            post(f"zones/{zone_id}/email/routing/dns", {})
         except RuntimeError as e:
             if "already enabled" not in str(e).lower():
                 raise
@@ -683,7 +703,7 @@ def make_email_routing_catch_all(
             "matchers": [{"type": "all"}],
         })
         try:
-            post(f"zones/{zone_id}/email/routing/disable", {})
+            delete(f"zones/{zone_id}/email/routing/dns")
         except RuntimeError as e:
             if "already disabled" not in str(e).lower():
                 raise
@@ -838,10 +858,10 @@ def fetch_zone(
     records = paginate(f"zones/{zone_id}/dns_records")
     routes = paginate(f"zones/{zone_id}/workers/routes")
     settings = paginate(f"zones/{zone_id}/settings")
+    sending_subdomains = paginate(f"zones/{zone_id}/email/sending/subdomains")
 
     zone["settings"] = {setting["id"]: setting for setting in settings}
     zone["dnssec"] = get(f"zones/{zone_id}/dnssec")
-
     for record in records:
         if is_managed_record(record):
             continue
@@ -851,6 +871,9 @@ def fetch_zone(
             make_record(remote, zone, remote_data=record)
     for route in routes:
         make_route(remote, zone, remote_data=route)
+    for sending_subdomain in sending_subdomains:
+        if sending_subdomain.get("enabled"):
+            make_email_sending_subdomain(remote, zone, remote_data=sending_subdomain)
 
     fetch_email_routing(remote, zone)
     fetch_zone_settings(remote, zone, setting_ids, all_missing)
