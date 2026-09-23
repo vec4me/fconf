@@ -1,0 +1,7 @@
+; managed by Functional Configurator
+$INCLUDE _defaults.zone
+; cloudflare redirect 301 '(http.host eq "pyusoft.com")' 'concat("https://www.pyusoft.com", http.request.uri.path)'
+; cloudflare redirect 301 '(http.host eq "www.pyusoft.com" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://www.pyusoft.com/", "")'
+pyusoft.com.        1 IN A     64.176.34.52            ; cloudflare proxied
+www.pyusoft.com.    1 IN A     64.176.34.52            ; cloudflare proxied
+_dmarc.pyusoft.com. 1 IN TXT   "v=DMARC1; p=quarantine;"

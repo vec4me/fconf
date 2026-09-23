@@ -1,0 +1,23 @@
+{
+    "auto_renew": true,
+    "contact_roles": ["registrant", "admin", "tech", "billing"],
+    "services": ["proxy"],
+    "disclose": false,
+    "domains": [
+        "2204355.com",
+        "bestratereview.com",
+        "clarkn.co.jp",
+        "hironavi.com",
+        "hiroshimajobnavi.com",
+        "je.gy",
+        "leetforms.com",
+        "notatel.com",
+        "pyusoft.com",
+        "roteni.com",
+        "southtowntattoocollective.com",
+        "stripemerchant.com",
+        "tattoocollectivereno.com",
+        "valgrid.co",
+        "vec4me.com"
+    ]
+}

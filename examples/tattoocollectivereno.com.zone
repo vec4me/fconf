@@ -1,0 +1,8 @@
+; managed by Functional Configurator
+$INCLUDE _defaults.zone
+; cloudflare worker-domain tattoocollectivereno-website:tattoocollectivereno.com
+; cloudflare worker-domain tattoocollectivereno-website:www.tattoocollectivereno.com
+; cloudflare redirect 301 '(http.host eq "tattoocollectivereno.com")' 'concat("https://www.tattoocollectivereno.com", http.request.uri.path)'
+; cloudflare redirect 301 '(http.host eq "www.tattoocollectivereno.com" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://www.tattoocollectivereno.com/", "")'
+; cloudflare email-forward tattoocollectivereno@gmail.com
+_dmarc.tattoocollectivereno.com. 1 IN TXT   "v=DMARC1; p=quarantine;"

@@ -1,3 +1,1 @@
-lint.select = ["ALL"]
-lint.ignore = ["D203", "D213", "PLR0913", "TC003"]
-line-length = 120
+lint.select = ["F", "E9", "B", "PLE", "RUF100", "RUF200"]

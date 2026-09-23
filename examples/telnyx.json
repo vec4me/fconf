@@ -1,0 +1,47 @@
+{
+    "messaging_profile": {
+        "webhook_url": "https://sms-cloudflare-central.vec4me.workers.dev/",
+        "webhook_api_version": "2",
+        "whitelisted_destinations": ["*"]
+    },
+    "outbound_voice_profile": {
+        "traffic_type": "conversational",
+        "service_plan": "global",
+        "whitelisted_destinations": ["US", "CA", "MX", "JP"]
+    },
+    "credential_connection": {
+        "sip_uri_calling_preference": "unrestricted",
+        "inbound": {
+            "generate_ringback_tone": false
+        },
+        "outbound": {
+            "ani_override_type": "always",
+            "generate_ringback_tone": false,
+            "instant_ringback_enabled": false
+        }
+    },
+    "voice_settings": {
+        "media_features": {
+            "t38_fax_gateway_enabled": true,
+            "rtp_auto_adjust_enabled": false
+        }
+    },
+    "number_settings": {
+        "number_level_routing": "disabled",
+        "external_pin": "5669",
+        "hd_voice_enabled": false
+    },
+    "numbers": {
+        "+17752000767": {
+            "messaging_profile_name": "msg-+17752000767",
+            "outbound_voice_profile_name": "voice-+17752000767",
+            "credential_connection_name": "sip-+17752000767",
+            "sip_user_name": "user0767",
+            "call_forwarding": {
+                "call_forwarding_enabled": true,
+                "forwards_to": "+819094141337",
+                "forwarding_type": "always"
+            }
+        }
+    }
+}

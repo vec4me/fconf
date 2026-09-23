@@ -1,0 +1,11 @@
+; managed by Functional Configurator
+$INCLUDE _defaults.zone
+; cloudflare page-domain hiroshimajobnavi:hiroshimajobnavi.com
+; cloudflare page-domain hiroshimajobnavi:www.hiroshimajobnavi.com
+; cloudflare redirect 301 '(http.host eq "hiroshimajobnavi.com")' 'concat("https://www.hiroshimajobnavi.com", http.request.uri.path)'
+; cloudflare redirect 301 '(http.host eq "www.hiroshimajobnavi.com" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://www.hiroshimajobnavi.com/", "")'
+; cloudflare setting ssl=full
+; cloudflare email-forward info@clarkn.co.jp
+hiroshimajobnavi.com.        1 IN CNAME hiroshimajobnavi.pages.dev.  ; cloudflare proxied
+www.hiroshimajobnavi.com.    1 IN CNAME hiroshimajobnavi.pages.dev.  ; cloudflare proxied
+_dmarc.hiroshimajobnavi.com. 1 IN TXT   "v=DMARC1; p=quarantine;"

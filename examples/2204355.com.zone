@@ -1,0 +1,9 @@
+; managed by Functional Configurator
+$INCLUDE _defaults.zone
+; cloudflare page-domain 2204355-website:2204355.com
+; cloudflare page-domain 2204355-website:www.2204355.com
+; cloudflare redirect 301 '(http.host eq "www.2204355.com")' 'concat("https://2204355.com", http.request.uri.path)'
+; cloudflare redirect 301 '(http.host eq "2204355.com" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://2204355.com/", "")'
+2204355.com.        1 IN CNAME 2204355.pages.dev.       ; cloudflare proxied
+www.2204355.com.    1 IN CNAME 2204355.pages.dev.       ; cloudflare proxied
+_dmarc.2204355.com. 1 IN TXT   "v=DMARC1; p=quarantine;"

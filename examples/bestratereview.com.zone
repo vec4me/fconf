@@ -1,0 +1,10 @@
+; managed by Functional Configurator
+$INCLUDE _defaults.zone
+; cloudflare redirect 301 '(http.host eq "bestratereview.com")' 'concat("https://www.bestratereview.com", http.request.uri.path)'
+; cloudflare redirect 301 '(http.host eq "www.bestratereview.com" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://www.bestratereview.com/", "")'
+bestratereview.com.        1 IN A     35.192.114.80            ; cloudflare proxied
+www.bestratereview.com.    1 IN A     35.192.114.80            ; cloudflare proxied
+bestratereview.com.        1 IN MX    1 smtp.google.com.
+bestratereview.com.        1 IN TXT   "v=spf1 include:_spf.google.com ~all"
+bestratereview.com.        1 IN TXT   "google-site-verification=1O4KHQCY_QaBmRlMHA_WUU3LGeqjmKr_4JN25L5_ybQ"
+_dmarc.bestratereview.com. 1 IN TXT   "v=DMARC1; p=quarantine;"

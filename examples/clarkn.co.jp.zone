@@ -1,0 +1,15 @@
+; managed by Functional Configurator
+$INCLUDE _defaults.zone
+; cloudflare worker-domain clarkn:clarkn.co.jp
+; cloudflare worker-domain clarkn:www.clarkn.co.jp
+; cloudflare worker-domain clarkn-meet:meet.clarkn.co.jp
+; cloudflare redirect 301 '(http.host eq "clarkn.co.jp")' 'concat("https://www.clarkn.co.jp", http.request.uri.path)'
+; cloudflare redirect 301 '(http.host eq "www.clarkn.co.jp" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://www.clarkn.co.jp/", "")'
+; cloudflare route api.clarkn.co.jp/*=clarkn
+api.clarkn.co.jp.    1 IN CNAME clarkn.vec4me.workers.dev.     ; cloudflare proxied
+clarkn.co.jp.        1 IN MX    1 smtp.google.com.
+clarkn.co.jp.        1 IN TXT   "v=spf1 include:_spf.google.com ~all"
+clarkn.co.jp.        1 IN TXT   "google-site-verification=ZsBDgLNcr70Rc7e6dF47J7pbLp435l1CF-hHyf6EaQM"
+clarkn.co.jp.        1 IN TXT   "google-site-verification=ZH2D3QODde7h7X2yI299oREgSXmMcPbtKjtl122vmqg"
+uni.clarkn.co.jp.    1 IN A     219.211.176.140
+_dmarc.clarkn.co.jp. 1 IN TXT   "v=DMARC1; p=quarantine;"
