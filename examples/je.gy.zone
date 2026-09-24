@@ -5,6 +5,7 @@ $INCLUDE _defaults.zone
 ; cloudflare redirect 301 '(http.host eq "www.je.gy")' 'concat("https://je.gy", http.request.uri.path)'
 ; cloudflare redirect 301 '(http.host eq "je.gy" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://je.gy/", "")'
 ; cloudflare route api.je.gy/*=jegy-api
+; cloudflare email-forward *=vec4me@icloud.com
 je.gy.        1 IN CNAME jegy.pages.dev.              ; cloudflare proxied
 www.je.gy.    1 IN CNAME jegy.pages.dev.              ; cloudflare proxied
 api.je.gy.    1 IN CNAME jegy-api.vec4me.workers.dev. ; cloudflare proxied

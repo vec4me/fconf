@@ -5,6 +5,7 @@ $INCLUDE _defaults.zone
 ; cloudflare redirect 301 '(http.host eq "leetforms.com")' 'concat("https://www.leetforms.com", http.request.uri.path)'
 ; cloudflare redirect 301 '(http.host eq "www.leetforms.com" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://www.leetforms.com/", "")'
 ; cloudflare route api.leetforms.com/*=leetforms-api
+; cloudflare email-forward *=vec4me@icloud.com
 leetforms.com.        1 IN CNAME leetforms.pages.dev.              ; cloudflare proxied
 www.leetforms.com.    1 IN CNAME leetforms.pages.dev.              ; cloudflare proxied
 api.leetforms.com.    1 IN CNAME leetforms-api.vec4me.workers.dev. ; cloudflare proxied

@@ -32,7 +32,7 @@ Plans contain plain `push`, `remove`, `replace`, and non-mutating `unknown` oper
 Application reports every operation as completed, failed, or skipped; a failed prerequisite skips its dependents. Every provider is re-observed after application, and success requires the verification plan to be empty.
 
 ## Email Routing
-Use `; cloudflare email-forward address@example.com` in a domain's zone file to declare its forwarding destination. Cloudflare owns the required Email Routing DNS records. Google-hosted domains declare their ordinary MX, SPF, and verification records directly in their zone files.
+Use `; cloudflare email-forward source@example.com=destination@example.net` to declare one mailbox mapping or `; cloudflare email-forward *=destination@example.net` to declare a catch-all. Cloudflare owns the required Email Routing DNS records. Google-hosted domains declare their ordinary MX, SPF, and verification records directly in their zone files.
 
 ## Zone Files
 Each `examples/example.com.zone` file is a standard BIND-style zone file. Ordinary DNS tools ignore the whole-line Cloudflare annotations, while the configurator uses them for provider relationships:
@@ -41,7 +41,7 @@ Each `examples/example.com.zone` file is a standard BIND-style zone file. Ordina
 ; cloudflare page-domain example-website:example.com
 $INCLUDE _defaults.zone
 ; cloudflare page-domain example-website:www.example.com
-; cloudflare email-forward mailbox@example.net
+; cloudflare email-forward inbox@example.com=mailbox@example.net
 ; cloudflare setting ssl=full
 ; cloudflare route api.example.com/*=example-api
 ; cloudflare redirect 301 '(http.host eq "example.com")' 'concat("https://www.example.com", http.request.uri.path)'

@@ -134,6 +134,20 @@ def compileCloudflareDesiredStateBeforeObservation() -> None:
     patch.assert_called_once_with({}, "zones/zone-id/settings/ssl", reconciliation.Node(desired, setting)["value"])
 
 
+def identifyUnreferencedCloudflareDeployments() -> None:
+    """Verify deployment diagnostics derive references from every declaration kind."""
+    configurations = {
+        "example.com": {
+            "worker_domains": ["website:example.com"],
+            "routes": ["api.example.com/*=api"],
+            "page_domains": ["site:www.example.com"],
+        },
+    }
+    workers, pages = cloudflare.ReferencedDeployments(configurations)
+    assert workers == {"website", "api"}
+    assert pages == {"site"}
+
+
 def leaveUndeclaredTelnyxResourcesUntouched() -> None:
     """Verify Telnyx observation retains only exact managed identities."""
     responses: dict[str, list[dict[str, object]]] = {
@@ -210,17 +224,60 @@ def keepTelnyxPlanFreeOfMutationCallbacks() -> None:
     assert reconciliation.ReconciliationPlan(observed, desired, dependencies, {}) == []
 
 
+def planTelnyxCleanupAsExplicitRemovals() -> None:
+    """Verify stale Telnyx resources become ordinary planned removals."""
+    directory = pathlib.Path(__file__).parent.parent / "examples/"
+    configuration = json.loads((directory / "telnyx.json").read_text(encoding="utf-8"))
+    number = "+17752000767"
+    numberconfiguration = configuration["numbers"][number]
+    voice = {**configuration["voice_settings"], "connection_id": "connection-id", "call_forwarding": numberconfiguration["call_forwarding"]}
+    connection = {"id": "connection-id", "connection_name": numberconfiguration["credential_connection_name"], "user_name": numberconfiguration["sip_user_name"], **configuration["credential_connection"]}
+    connection["outbound"] = {**connection["outbound"], "ani_override": number, "outbound_voice_profile_id": "voice-id"}
+    profiles: telnyx.TelnyxData = {
+        "phone_numbers": {number: {"id": "number-id"}},
+        "messaging_profiles": [{"id": "message-id", "name": numberconfiguration["messaging_profile_name"], **configuration["messaging_profile"]}],
+        "voice_profiles": [{"id": "voice-id", "name": numberconfiguration["outbound_voice_profile_name"], **configuration["outbound_voice_profile"]}],
+        "credential_connections": [connection],
+        "phone_number_details": {number: {"number": configuration["number_settings"], "messaging": {"messaging_profile_id": "message-id"}, "voice": voice}},
+        "cleanup_resources": [{"kind": "messaging_profiles", "id": "orphan-id", "name": "msg-old"}],
+    }
+    observed, desired, _observedresources, _desiredresources, dependencies = telnyx.ConfigurationTrees(profiles, configuration)
+    plan = reconciliation.ReconciliationPlan(observed, desired, dependencies, {})
+    assert [(operation["action"], operation["path"]) for operation in plan] == [("remove", ("cleanup", "messaging_profiles", "orphan-id"))]
+
+
 def reportPartialCloudflareReplacementFailure() -> None:
     """Verify a failed create preserves the preceding successful removal."""
-    path: reconciliation.Path = ("zones", "example.com", "records", "www/A/old")
-    observed: cloudflare.Resources = {path: {"kind": "record", "zone": "example.com", "record_id": "record-id"}}
-    desired: cloudflare.Resources = {path: {"kind": "record", "zone": "example.com", "record_id": None}}
-    operation = {"action": "replace", "path": path, "after": {"type": "A"}}
+    path: reconciliation.Path = ("zones", "example.com", "routes", "example.com/*")
+    observed: cloudflare.Resources = {path: {"kind": "route", "zone": "example.com", "route_id": "route-id"}}
+    desired: cloudflare.Resources = {path: {"kind": "route", "zone": "example.com", "route_id": None}}
+    operation = {"action": "replace", "path": path, "after": {"pattern": "example.com/*"}}
     zones: dict[str, cloudflare.Zone] = {"example.com": {"id": "zone-id", "name": "example.com"}}
     with mock.patch.object(cloudflare, "removeResource") as remove, mock.patch.object(cloudflare, "pushResource", side_effect=RuntimeError("create failed")):
         result = cloudflare.execute({}, operation, observed, desired, zones)
     remove.assert_called_once()
     assert result == {"completed_steps": ["remove"], "error": "create failed"}
+
+
+def replaceCnameRecordInPlace() -> None:
+    """Verify changing a CNAME target preserves identity and performs one provider mutation."""
+    zone: cloudflare.Zone = {"id": "zone-id", "name": "example.com"}
+    observed: reconciliation.ConfigTree = {}
+    desired: reconciliation.ConfigTree = {}
+    observedresources: cloudflare.Resources = {}
+    desiredresources: cloudflare.Resources = {}
+    cloudflare.makeRecord(observed, observedresources, zone, remotedata={
+        "id": "record-id", "name": "www.example.com", "type": "CNAME", "content": "old.example.net",
+        "proxied": True, "ttl": 1, "comment": None, "tags": [], "settings": {"flatten_cname": False},
+    })
+    cloudflare.makeRecord(desired, desiredresources, zone, "www", "CNAME", "new.example.net", proxied=True, ttl=1)
+    plan = reconciliation.ReconciliationPlan(observed, desired, {}, {})
+    assert len(plan) == 1
+    assert plan[0]["action"] == "replace"
+    with mock.patch.object(cloudflare, "put") as put:
+        result = cloudflare.execute({}, plan[0], observedresources, desiredresources, {"example.com": zone})
+    put.assert_called_once_with({}, "zones/zone-id/dns_records/record-id", plan[0]["after"])
+    assert result == {"completed_steps": ["replace"], "error": None}
 
 
 def projectOnlyDeclaredTelnyxFields() -> None:
@@ -280,6 +337,54 @@ def observeEveryDeclaredCloudflareSetting() -> None:
     get.assert_called_once_with({}, "zones/zone-id/settings/origin_max_http_version")
 
 
+def preserveExplicitEmailForwardingSource() -> None:
+    """Verify an explicit source mailbox remains part of the desired resource identity."""
+    directory = pathlib.Path(__file__).parent.parent / "examples/"
+    configurations = {"tattoocollectivereno.com": zone_file.readAnnotations(directory / "tattoocollectivereno.com.zone")}
+    desired, resources, _zones, destinations, _settingids = cloudflare.compileDesired(directory, configurations)
+    path = ("zones", "tattoocollectivereno.com", "email_routing_rules", "ink@tattoocollectivereno.com")
+    assert reconciliation.Node(desired, path)["value"] == {
+        "enabled": True,
+        "actions": [{"type": "forward", "value": ["tattoocollectivereno@gmail.com"]}],
+        "matchers": [{"type": "literal", "field": "to", "value": "ink@tattoocollectivereno.com"}],
+    }
+    assert resources[path]["push_after"] == (("email routing destinations", "tattoocollectivereno@gmail.com"),)
+    assert destinations == {"tattoocollectivereno@gmail.com"}
+
+
+def protectEveryEmailRuleWhenObservationFails() -> None:
+    """Verify failed Email Routing observation protects every managed rule kind."""
+    zones: dict[str, cloudflare.Zone] = {
+        "zone-id": {
+            "name": "example.com",
+            "unavailable": {"email routing": "authentication failed"},
+        },
+    }
+    unknowns = cloudflare.Unknowns(zones)
+    assert unknowns == {
+        ("zones", "example.com", "email_routing_catch_all"): "authentication failed",
+        ("zones", "example.com", "email_routing_rules"): "authentication failed",
+    }
+
+
+def preserveOriginalDefaultEmailForwards() -> None:
+    """Verify every original default-forwarding zone explicitly declares its catch-all."""
+    directory = pathlib.Path(__file__).parent.parent / "examples/"
+    zones = {
+        "2204355.com",
+        "hironavi.com",
+        "leetforms.com",
+        "notatel.com",
+        "pyusoft.com",
+        "roteni.com",
+        "stripemerchant.com",
+        "vec4me.com",
+    }
+    for zone in zones:
+        configuration = zone_file.readAnnotations(directory / f"{zone}.zone")
+        assert "*=vec4me@icloud.com" in configuration["email_forwards"]
+
+
 def giveRegeryExplicitProviderClients() -> None:
     """Verify Regery reconciliation receives Cloudflare observations as input."""
     regeryclient = {"provider": "regery"}
@@ -308,13 +413,19 @@ def main() -> None:
     requireObservedConvergence()
     letLocalSettingsOverrideIncludedDefaults()
     compileCloudflareDesiredStateBeforeObservation()
+    identifyUnreferencedCloudflareDeployments()
     leaveUndeclaredTelnyxResourcesUntouched()
     keepRegeryPlanFreeOfMutationCallbacks()
     keepTelnyxPlanFreeOfMutationCallbacks()
+    planTelnyxCleanupAsExplicitRemovals()
     reportPartialCloudflareReplacementFailure()
+    replaceCnameRecordInPlace()
     projectOnlyDeclaredTelnyxFields()
     rejectMissingProviderCredentials()
     observeEveryDeclaredCloudflareSetting()
+    preserveExplicitEmailForwardingSource()
+    protectEveryEmailRuleWhenObservationFails()
+    preserveOriginalDefaultEmailForwards()
     giveRegeryExplicitProviderClients()
 
 

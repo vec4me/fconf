@@ -119,15 +119,30 @@ def fetchState(client: Client, numberconfigurations: dict[str, dict[str, object]
     messagingnames = {str(configuration["messaging_profile_name"]) for configuration in numberconfigurations.values()}
     voicenames = {str(configuration["outbound_voice_profile_name"]) for configuration in numberconfigurations.values()}
     connectionnames = {str(configuration["credential_connection_name"]) for configuration in numberconfigurations.values()}
-    messagingsummaries = [
-        profile for profile in paginate(client, "messaging_profiles") if str(profile["name"]) in messagingnames
-    ]
-    voicesummaries = [
-        profile for profile in paginate(client, "outbound_voice_profiles") if str(profile["name"]) in voicenames
-    ]
-    connectionsummaries = [
-        profile for profile in paginate(client, "credential_connections") if str(profile["connection_name"]) in connectionnames
-    ]
+    allmessaging = sorted(paginate(client, "messaging_profiles"), key=lambda profile: str(profile["id"]))
+    allvoices = sorted(paginate(client, "outbound_voice_profiles"), key=lambda profile: str(profile["id"]))
+    allconnections = sorted(paginate(client, "credential_connections"), key=lambda profile: str(profile["id"]))
+    messagingsummaries = [profile for profile in allmessaging if str(profile["name"]) in messagingnames]
+    voicesummaries = [profile for profile in allvoices if str(profile["name"]) in voicenames]
+    connectionsummaries = [profile for profile in allconnections if str(profile["connection_name"]) in connectionnames]
+    cleanupresources: list[dict[str, object]] = []
+    for kind, profiles, namekey, prefix, managednames in (
+        ("messaging_profiles", allmessaging, "name", "msg-", messagingnames),
+        ("outbound_voice_profiles", allvoices, "name", "voice-", voicenames),
+        ("credential_connections", allconnections, "connection_name", "sip-", connectionnames),
+    ):
+        seen: set[str] = set()
+        for profile in profiles:
+            name = str(profile[namekey])
+            orphan = kind == "messaging_profiles" and name.startswith(prefix) and name not in managednames and profile.get("phone_numbers_count") == 0
+            duplicate = name.startswith(prefix) and name in seen
+            if orphan or duplicate:
+                cleanupresources.append({"kind": kind, "id": profile["id"], "name": name})
+            seen.add(name)
+    cleanupids = {str(resource["id"]) for resource in cleanupresources}
+    messagingsummaries = [profile for profile in messagingsummaries if str(profile["id"]) not in cleanupids]
+    voicesummaries = [profile for profile in voicesummaries if str(profile["id"]) not in cleanupids]
+    connectionsummaries = [profile for profile in connectionsummaries if str(profile["id"]) not in cleanupids]
     messagingprofiles = [cast("dict[str, object]", sendRequest(client, "get", f"messaging_profiles/{profile['id']}")) for profile in messagingsummaries]
     voiceprofiles = [cast("dict[str, object]", sendRequest(client, "get", f"outbound_voice_profiles/{profile['id']}")) for profile in voicesummaries]
     credentialconnections = [cast("dict[str, object]", sendRequest(client, "get", f"credential_connections/{profile['id']}")) for profile in connectionsummaries]
@@ -151,6 +166,7 @@ def fetchState(client: Client, numberconfigurations: dict[str, dict[str, object]
         "voice_profiles": voiceprofiles,
         "credential_connections": credentialconnections,
         "phone_number_details": phonenumberdetails,
+        "cleanup_resources": cleanupresources,
     }
 
 
@@ -173,6 +189,10 @@ def ConfigurationTrees(
     observedresources: Resources = {}
     desiredresources: Resources = {}
     dependencies: reconciliation.Dependencies = {}
+    for resource in profiledata.get("cleanup_resources", []):
+        path = ("cleanup", str(resource["kind"]), str(resource["id"]))
+        reconciliation.setValue(observed, path, {"name": resource["name"]})
+        observedresources[path] = cast("dict[str, object]", resource)
     numbers = cast("dict[str, dict[str, object]]", configuration["numbers"])
     categories = {
         "messaging_profile": ("messaging_profiles", "messaging_profile_name", "messaging_profiles", "name"),

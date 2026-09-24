@@ -4,7 +4,7 @@ $INCLUDE _defaults.zone
 ; cloudflare page-domain valgrid:www.valgrid.co
 ; cloudflare redirect 301 '(http.host eq "www.valgrid.co")' 'concat("https://valgrid.co", http.request.uri.path)'
 ; cloudflare redirect 301 '(http.host eq "valgrid.co" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://valgrid.co/", "")'
-; cloudflare email-forward valgrid0011@gmail.com
+; cloudflare email-forward *=valgrid0011@gmail.com
 valgrid.co.        1 IN CNAME valgrid.pages.dev.           ; cloudflare proxied
 www.valgrid.co.    1 IN CNAME valgrid.pages.dev.           ; cloudflare proxied
 _dmarc.valgrid.co. 1 IN TXT   "v=DMARC1; p=quarantine;"

@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 LeafNode = dict[str, object]
-ConfigTree = dict[str, "ConfigTree | LeafNode"]
 Path = tuple[str, ...]
+ConfigTree = dict[Path, LeafNode]
 Diff = tuple[Action, Path, LeafNode]
 Plan = list[dict[str, object]]
 TransitionResult = dict[str, object]
@@ -25,91 +25,28 @@ Unknowns = dict[Path, str]
 
 def setValue(tree: ConfigTree, path: Path, value: object) -> None:
     """Set one plain resource value without registering mutation behavior."""
-    current: ConfigTree = tree
-    for key in path[:-1]:
-        if key not in current:
-            current[key] = {}
-        current = cast("ConfigTree", current[key])
-    current[path[-1]] = {"value": value}
-
-
-def IsLeaf(node: ConfigTree | LeafNode) -> bool:
-    """Check whether a node is a leaf node."""
-    return "value" in node
-
-
-def LeafValue(node: ConfigTree | LeafNode) -> LeafNode:
-    """Return a node as a leaf after checking IsLeaf."""
-    return cast("LeafNode", node)
-
-def TreeValue(node: ConfigTree | LeafNode) -> ConfigTree:
-    """Narrow a node to ConfigTree after checking it is not a leaf."""
-    return cast("ConfigTree", node)
-
-def OneSidedDifferences(
-    source: ConfigTree,
-    action: Literal["remove", "push"],
-    keys: set[str],
-    path: Path,
-) -> Generator[Diff, None, None]:
-    """Yield diffs for keys only present on one side."""
-    empty: ConfigTree = {}
-    for key in sorted(keys):
-        node = source[key]
-        if IsLeaf(node):
-            yield (action, (*path, key), LeafValue(node))
-        elif action == "remove":
-            yield from TreeDifferences(TreeValue(node), empty, (*path, key))
-        else:
-            yield from TreeDifferences(empty, TreeValue(node), (*path, key))
-
-
-def SharedKeyDifferences(
-    remotenode: ConfigTree | LeafNode,
-    localnode: ConfigTree | LeafNode,
-    key: str,
-    path: Path,
-) -> Generator[Diff, None, None]:
-    """Yield diffs for a key present in both trees."""
-    if IsLeaf(remotenode) and IsLeaf(localnode):
-        if remotenode["value"] != localnode["value"]:
-            yield ("replace", (*path, key), LeafValue(localnode))
-    elif not IsLeaf(remotenode) and not IsLeaf(localnode):
-        yield from TreeDifferences(TreeValue(remotenode), TreeValue(localnode), (*path, key))
-    else:
-        if IsLeaf(remotenode):
-            yield ("remove", (*path, key), LeafValue(remotenode))
-        if IsLeaf(localnode):
-            yield ("push", (*path, key), LeafValue(localnode))
+    tree[path] = {"value": value}
 
 
 def TreeDifferences(
     remote: ConfigTree,
     local: ConfigTree,
-    path: Path = (),
 ) -> Generator[Diff, None, None]:
-    """Yield diffs between two config trees."""
+    """Yield differences between two flat resource maps."""
     remotekeys = set(remote.keys())
     localkeys = set(local.keys())
-
-    yield from OneSidedDifferences(remote, "remove", remotekeys - localkeys, path)
-    yield from OneSidedDifferences(local, "push", localkeys - remotekeys, path)
-
-    for key in sorted(remotekeys & localkeys):
-        yield from SharedKeyDifferences(remote[key], local[key], key, path)
+    for path in sorted(remotekeys - localkeys):
+        yield ("remove", path, remote[path])
+    for path in sorted(localkeys - remotekeys):
+        yield ("push", path, local[path])
+    for path in sorted(remotekeys & localkeys):
+        if remote[path]["value"] != local[path]["value"]:
+            yield ("replace", path, local[path])
 
 
 def Node(remote: ConfigTree, path: Path) -> LeafNode | None:
-    """Retrieve a leaf node from the remote tree by path."""
-    tree = remote
-    for key in path[:-1]:
-        if key not in tree:
-            return None
-        tree = TreeValue(tree[key])
-    if path[-1] not in tree:
-        return None
-    node = tree[path[-1]]
-    return LeafValue(node) if IsLeaf(node) else None
+    """Retrieve a resource leaf by path."""
+    return remote.get(path)
 
 
 def DictionaryDelta(old: dict[str, object], new: dict[str, object]) -> list[str]:

@@ -60,7 +60,7 @@ def readAnnotations(path: pathlib.Path) -> dict[str, object]:
         if len(words) != 2:
             raise ValueError(f"{sourcepath}: invalid Cloudflare annotation: {line}")
         relationship, value = words
-        if relationship in {"page-domain", "route", "worker-domain"}:
+        if relationship in {"email-forward", "page-domain", "route", "worker-domain"}:
             values = cast("list[str]", annotations.setdefault(f"{relationship.replace('-', '_')}s", []))
             values.append(value)
             continue

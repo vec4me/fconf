@@ -319,7 +319,8 @@ def makeRecord(
         content = str(value["content"])
         recordtype = str(value["type"])
 
-    path: Path = ("zones", zonename, "records", f"{name}/{recordtype}/{content}")
+    identity = f"{name}/{recordtype}" if recordtype == "CNAME" else f"{name}/{recordtype}/{content}"
+    path: Path = ("zones", zonename, "records", identity)
     setResource(tree, operations, path, value, "record", zone=zonename, record_id=recordid)
 
 
@@ -593,6 +594,44 @@ def makeEmailRoutingCatchAll(
         operations[path]["push_after"] = (("email routing destinations", forwardto),)
 
 
+def makeEmailRoutingRule(
+    tree: ConfigTree,
+    operations: Resources,
+    zone: Zone,
+    source: str | None = None,
+    forwardto: str | None = None,
+    *,
+    remotedata: dict[str, object] | None = None,
+) -> None:
+    """Build one literal-address Email Routing rule node."""
+    zonename = str(zone["name"])
+    ruleid: str | None = None
+    if remotedata:
+        ruleid = str(remotedata["id"])
+        matchers = cast("list[dict[str, object]]", remotedata["matchers"])
+        literal = next((matcher for matcher in matchers if matcher.get("type") == "literal" and matcher.get("field") == "to"), None)
+        if literal is None:
+            return
+        source = str(literal["value"])
+        value: dict[str, object] = {
+            "enabled": remotedata["enabled"],
+            "actions": remotedata["actions"],
+            "matchers": remotedata["matchers"],
+        }
+    else:
+        if source is None or forwardto is None:
+            raise ValueError(f"{zonename} email routing rule requires source and destination")
+        value = {
+            "enabled": True,
+            "actions": [{"type": "forward", "value": [forwardto]}],
+            "matchers": [{"type": "literal", "field": "to", "value": source}],
+        }
+    path: Path = ("zones", zonename, "email_routing_rules", str(source))
+    setResource(tree, operations, path, value, "email_routing_rule", zone=zonename, rule_id=ruleid)
+    if forwardto is not None:
+        operations[path]["push_after"] = (("email routing destinations", forwardto),)
+
+
 def makeDestinationAddress(tree: ConfigTree, operations: Resources, address: str) -> None:
     """Build an account Email Routing destination-address node."""
     path: Path = ("email routing destinations", address)
@@ -650,6 +689,13 @@ def pushResource(client: Client, resource: dict[str, object], value: object, zon
             if "already enabled" not in str(error).lower():
                 raise
         put(client, f"zones/{zone['id']}/email/routing/rules/catch_all", cast("dict[str, object]", value))
+    elif kind == "email_routing_rule":
+        try:
+            post(client, f"zones/{zone['id']}/email/routing/dns", {})
+        except RuntimeError as error:
+            if "already enabled" not in str(error).lower():
+                raise
+        post(client, f"zones/{zone['id']}/email/routing/rules", cast("dict[str, object]", value))
     elif kind == "destination":
         post(client, f"accounts/{client['accountid']}/email/routing/addresses", {"email": resource["address"]})
         logger.warning("  destination %s needs verification - check inbox", resource["address"])
@@ -677,13 +723,22 @@ def removeResource(client: Client, resource: dict[str, object], zones: dict[str,
         delete(client, f"accounts/{client['accountid']}/workers/domains/{resource['domain_id']}")
     elif kind == "email_routing":
         put(client, f"zones/{zone['id']}/email/routing/rules/catch_all", {"enabled": False, "actions": [{"type": "drop"}], "matchers": [{"type": "all"}]})
-        try:
-            delete(client, f"zones/{zone['id']}/email/routing/dns")
-        except RuntimeError as error:
-            if "already disabled" not in str(error).lower():
-                raise
+    elif kind == "email_routing_rule":
+        delete(client, f"zones/{zone['id']}/email/routing/rules/{resource['rule_id']}")
     else:
         raise RuntimeError(f"Cloudflare {kind} does not support removal")
+
+
+def replaceResource(client: Client, observed: dict[str, object], desired: dict[str, object], value: object, zones: dict[str, Zone]) -> None:
+    """Replace one Cloudflare resource without exposing an invalid intermediate state."""
+    kind = str(desired["kind"])
+    zone = zones[str(desired["zone"])] if "zone" in desired else None
+    if kind == "record":
+        put(client, f"zones/{zone['id']}/dns_records/{observed['record_id']}", cast("dict[str, object]", value))
+    elif kind in {"setting", "dnssec"}:
+        pushResource(client, desired, value, zones)
+    else:
+        raise RuntimeError(f"Cloudflare {kind} does not support in-place replacement")
 
 
 def execute(client: Client, operation: dict[str, object], observed: Resources, desired: Resources, zones: dict[str, Zone]) -> reconciliation.TransitionResult:
@@ -698,8 +753,8 @@ def execute(client: Client, operation: dict[str, object], observed: Resources, d
         elif action == "push":
             pushResource(client, desired[path], operation["after"], zones)
             completed.append("push")
-        elif desired[path]["kind"] in {"setting", "dnssec"}:
-            pushResource(client, desired[path], operation["after"], zones)
+        elif desired[path]["kind"] in {"record", "setting", "dnssec"}:
+            replaceResource(client, observed[path], desired[path], operation["after"], zones)
             completed.append("replace")
         else:
             removeResource(client, observed[path], zones)
@@ -768,13 +823,16 @@ def ManagedRecord(record: dict[str, object]) -> bool:
 
 
 def fetchEmailRouting(client: Client, remote: ConfigTree, operations: Resources, zone: Zone) -> None:
-    """Fetch email routing catch-all rule for a zone."""
+    """Fetch catch-all and literal-address Email Routing rules for a zone."""
     try:
         catchallresult = get(client, f"zones/{zone['id']}/email/routing/rules/catch_all")
         if isinstance(catchallresult, dict):
             catchall = cast("dict[str, object]", catchallresult)
             if catchall.get("enabled"):
                 makeEmailRoutingCatchAll(remote, operations, zone, remotedata=catchall)
+        for rule in paginate(client, f"zones/{zone['id']}/email/routing/rules"):
+            if rule.get("enabled"):
+                makeEmailRoutingRule(remote, operations, zone, remotedata=rule)
     except RuntimeError as error:
         if "not_found" not in str(error).lower() and "not enabled" not in str(error).lower():
             raise
@@ -892,9 +950,12 @@ def Unknowns(zones: dict[str, Zone]) -> reconciliation.Unknowns:
             "zone settings": ("zones", str(zone["name"]), "settings"),
             "DNSSEC": ("zones", str(zone["name"]), "dnssec"),
             "redirect rules": ("zones", str(zone["name"]), "redirect_rules"),
-            "email routing": ("zones", str(zone["name"]), "email_routing_catch_all"),
         }
         for resource, reason in unavailable.items():
+            if resource == "email routing":
+                unknowns[("zones", str(zone["name"]), "email_routing_catch_all")] = reason
+                unknowns[("zones", str(zone["name"]), "email_routing_rules")] = reason
+                continue
             if resource in boundaries:
                 unknowns[boundaries[resource]] = reason
     return unknowns
@@ -912,9 +973,12 @@ def configureDomains(local: reconciliation.ConfigTree, operations: Resources, zo
 
 def configureEmail(local: reconciliation.ConfigTree, operations: Resources, zone: Zone, configuration: dict[str, object]) -> None:
     """Configure Cloudflare Email Routing declared by a zone file."""
-    destination = configuration.get("email_forward")
-    if destination is not None:
-        makeEmailRoutingCatchAll(local, operations, zone, forwardto=str(destination))
+    for declaration in cast("list[str]", configuration.get("email_forwards", [])):
+        source, _separator, destination = declaration.partition("=")
+        if source == "*":
+            makeEmailRoutingCatchAll(local, operations, zone, forwardto=destination)
+        else:
+            makeEmailRoutingRule(local, operations, zone, source, destination)
 
 
 def configureRecords(local: reconciliation.ConfigTree, operations: Resources, zone: Zone, configuration: dict[str, object], directory: pathlib.Path) -> None:
@@ -955,7 +1019,11 @@ def compileDesired(directory: pathlib.Path, configurations: dict[str, dict[str, 
     desired: reconciliation.ConfigTree = {}
     operations: Resources = {}
     zones: dict[str, Zone] = {name: {"name": name} for name in configurations}
-    destinations = {str(configuration["email_forward"]) for configuration in configurations.values() if "email_forward" in configuration}
+    destinations = {
+        declaration.partition("=")[2]
+        for configuration in configurations.values()
+        for declaration in cast("list[str]", configuration.get("email_forwards", []))
+    }
     settingids = {settingid for configuration in configurations.values() for settingid in cast("dict[str, object]", configuration.get("settings", {}))}
     for destination in destinations:
         makeDestinationAddress(desired, operations, destination)
@@ -967,6 +1035,32 @@ def compileDesired(directory: pathlib.Path, configurations: dict[str, dict[str, 
         configureDomains(desired, operations, zone, configuration)
         configureSettings(desired, operations, zone, configuration)
     return desired, operations, zones, destinations, settingids
+
+
+def ReferencedDeployments(configurations: dict[str, dict[str, object]]) -> tuple[set[str], set[str]]:
+    """Return Worker and Pages deployment names referenced by zone declarations."""
+    workers: set[str] = set()
+    pages: set[str] = set()
+    for configuration in configurations.values():
+        for declaration in cast("list[str]", configuration.get("worker_domains", [])):
+            worker, _separator, _hostname = declaration.partition(":")
+            workers.add(worker)
+        for declaration in cast("list[str]", configuration.get("routes", [])):
+            _pattern, _separator, worker = declaration.partition("=")
+            workers.add(worker)
+        for declaration in cast("list[str]", configuration.get("page_domains", [])):
+            page, _separator, _hostname = declaration.partition(":")
+            pages.add(page)
+    return workers, pages
+
+
+def reportUnusedDeployments(configurations: dict[str, dict[str, object]], workers: dict[str, dict[str, object]], pages: dict[str, dict[str, object]]) -> None:
+    """Report observed deployments that no zone declaration references."""
+    usedworkers, usedpages = ReferencedDeployments(configurations)
+    for worker in sorted(set(workers) - usedworkers):
+        logger.info("unused Worker: %s", worker)
+    for page in sorted(set(pages) - usedpages):
+        logger.info("unused Pages project: %s", page)
 
 
 def bindZoneIdentities(zones: dict[str, Zone], observed: list[Zone]) -> None:
@@ -986,7 +1080,8 @@ def reconcile(directory: pathlib.Path, configurations: dict[str, dict[str, objec
     observedzones = cast("list[Zone]", paginate(client, "zones"))
     bindZoneIdentities(zones, observedzones)
     zonelist = list(zones.values())
-    remote, remoteresources, zones, _workers, _pages = fetchState(client, settingids=settingids, zonelist=zonelist)
+    remote, remoteresources, zones, workers, pages = fetchState(client, settingids=settingids, zonelist=zonelist)
+    reportUnusedDeployments(configurations, workers, pages)
     unknowns = Unknowns(zones)
     fetchDestinationAddresses(client, remote, remoteresources, destinations)
     dependencies = Dependencies(localresources)

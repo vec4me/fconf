@@ -6,5 +6,5 @@ $INCLUDE _defaults.zone
 ; cloudflare redirect 301 '(http.host eq "www.southtowntattoocollective.com" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://www.southtowntattoocollective.com/", "")'
 ; cloudflare redirect 301 '(http.host eq "www.southtowntattoocollective.com")' 'concat("https://www.tattoocollectivereno.com", http.request.uri.path)'
 ; cloudflare redirect 301 '(http.host eq "southtowntattoocollective.com")' 'concat("https://tattoocollectivereno.com", http.request.uri.path)'
-; cloudflare email-forward tattoocollectivereno@gmail.com
+; cloudflare email-forward *=tattoocollectivereno@gmail.com
 _dmarc.southtowntattoocollective.com. 1 IN TXT   "v=DMARC1; p=quarantine;"

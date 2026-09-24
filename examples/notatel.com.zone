@@ -4,6 +4,7 @@ $INCLUDE _defaults.zone
 ; cloudflare page-domain notatel-website:www.notatel.com
 ; cloudflare redirect 301 '(http.host eq "notatel.com")' 'concat("https://www.notatel.com", http.request.uri.path)'
 ; cloudflare redirect 301 '(http.host eq "www.notatel.com" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://www.notatel.com/", "")'
+; cloudflare email-forward *=vec4me@icloud.com
 notatel.com.           1 IN CNAME notatel.pages.dev.          ; cloudflare proxied
 www.notatel.com.       1 IN CNAME notatel.pages.dev.          ; cloudflare proxied
 sip.notatel.com.       1 IN CNAME sip.telnyx.com.

@@ -102,9 +102,15 @@ def checkZone(path: pathlib.Path, zonename: str, configuration: dict[str, object
         hostname = pattern.split("/", 1)[0].removeprefix("*.")
         if not separator or not HostBelongsToZone(hostname, zonename):
             errors.append(f"{path}: Worker route is outside {zonename}: {declaration}")
-    destination = configuration.get("email_forward")
-    if destination is not None and EMAIL_PATTERN.fullmatch(str(destination)) is None:
-        errors.append(f"{path}: invalid email-forward address: {destination}")
+    for declaration in cast("list[str]", configuration.get("email_forwards", [])):
+        source, separator, destination = declaration.partition("=")
+        if not separator:
+            errors.append(f"{path}: email-forward must be source=destination: {declaration}")
+            continue
+        if source != "*" and (EMAIL_PATTERN.fullmatch(source) is None or not HostBelongsToZone(source.rsplit("@", 1)[-1], zonename)):
+            errors.append(f"{path}: invalid email-forward source for {zonename}: {source}")
+        if EMAIL_PATTERN.fullmatch(destination) is None:
+            errors.append(f"{path}: invalid email-forward destination: {destination}")
     return errors
 
 
