@@ -5,7 +5,7 @@ $INCLUDE _defaults.zone
 ; cloudflare redirect 301 '(http.host eq "roteni.com")' 'concat("https://www.roteni.com", http.request.uri.path)'
 ; cloudflare redirect 301 '(http.host eq "www.roteni.com" and starts_with(http.request.uri.path, "/fbclid"))' 'concat("https://www.roteni.com/", "")'
 ; cloudflare route api.roteni.com/*=roteni-api
-; cloudflare email-forward *=vec4me@icloud.com
+; cloudflare email-forward *=jeff@je.gy
 roteni.com.        1 IN CNAME roteni.pages.dev.              ; cloudflare proxied
 www.roteni.com.    1 IN CNAME roteni.pages.dev.              ; cloudflare proxied
 api.roteni.com.    1 IN CNAME roteni-api.vec4me.workers.dev. ; cloudflare proxied

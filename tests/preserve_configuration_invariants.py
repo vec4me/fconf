@@ -337,6 +337,17 @@ def observeEveryDeclaredCloudflareSetting() -> None:
     get.assert_called_once_with({}, "zones/zone-id/settings/origin_max_http_version")
 
 
+def leaveProviderOwnedDnsRecordsUnmanaged() -> None:
+    """Verify read-only provider-generated DNS records never enter the mutation plan."""
+    record = {
+        "name": "media.example.com",
+        "type": "CNAME",
+        "content": "public.r2.dev",
+        "meta": {"r2_bucket": "bucket-id", "read_only": True},
+    }
+    assert cloudflare.ManagedRecord(record)
+
+
 def preserveExplicitEmailForwardingSource() -> None:
     """Verify an explicit source mailbox remains part of the desired resource identity."""
     directory = pathlib.Path(__file__).parent.parent / "examples/"
@@ -367,8 +378,8 @@ def protectEveryEmailRuleWhenObservationFails() -> None:
     }
 
 
-def preserveOriginalDefaultEmailForwards() -> None:
-    """Verify every original default-forwarding zone explicitly declares its catch-all."""
+def preserveCentralEmailForwardingChain() -> None:
+    """Verify default-forwarding zones explicitly route through the je.gy hub."""
     directory = pathlib.Path(__file__).parent.parent / "examples/"
     zones = {
         "2204355.com",
@@ -382,7 +393,9 @@ def preserveOriginalDefaultEmailForwards() -> None:
     }
     for zone in zones:
         configuration = zone_file.readAnnotations(directory / f"{zone}.zone")
-        assert "*=vec4me@icloud.com" in configuration["email_forwards"]
+        assert "*=jeff@je.gy" in configuration["email_forwards"]
+    configuration = zone_file.readAnnotations(directory / "je.gy.zone")
+    assert "*=vec4me@icloud.com" in configuration["email_forwards"]
 
 
 def giveRegeryExplicitProviderClients() -> None:
@@ -423,9 +436,10 @@ def main() -> None:
     projectOnlyDeclaredTelnyxFields()
     rejectMissingProviderCredentials()
     observeEveryDeclaredCloudflareSetting()
+    leaveProviderOwnedDnsRecordsUnmanaged()
     preserveExplicitEmailForwardingSource()
     protectEveryEmailRuleWhenObservationFails()
-    preserveOriginalDefaultEmailForwards()
+    preserveCentralEmailForwardingChain()
     giveRegeryExplicitProviderClients()
 
 

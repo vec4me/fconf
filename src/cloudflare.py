@@ -819,7 +819,7 @@ def ManagedRecord(record: dict[str, object]) -> bool:
     if record["type"] == "AAAA" and str(record["content"]).startswith("100::"):
         return True
     meta = cast("dict[str, object]", record.get("meta", {}))
-    return bool(meta.get("auto_added")) or bool(record.get("locked"))
+    return bool(meta.get("auto_added")) or bool(meta.get("read_only")) or bool(record.get("locked"))
 
 
 def fetchEmailRouting(client: Client, remote: ConfigTree, operations: Resources, zone: Zone) -> None:
@@ -866,6 +866,7 @@ def fetchZone(
     operations: Resources,
     zone: Zone,
     settingids: set[str],
+    declaredpaths: set[Path],
 ) -> None:
     """Fetch and process all remote state for a single zone."""
     zoneid = zone["id"]
@@ -879,6 +880,13 @@ def fetchZone(
     zone["dnssec"] = dnssec or {}
     for record in records or []:
         if ManagedRecord(record):
+            declared: ConfigTree = {}
+            declaredoperations: Resources = {}
+            makeRecord(declared, declaredoperations, zone, remotedata=record)
+            path = next(iter(declared))
+            if path in declaredpaths:
+                remote[path] = declared[path]
+                operations[path] = declaredoperations[path]
             continue
         if record["type"] == "SRV":
             makeSrvRecord(remote, operations, zone, remotedata=record)
@@ -893,10 +901,12 @@ def fetchState(
     client: Client,
     settingids: set[str],
     zonelist: list[Zone] | None = None,
+    declaredpaths: set[Path] | None = None,
 ) -> tuple[ConfigTree, Resources, dict[str, Zone], dict[str, dict[str, object]], dict[str, dict[str, object]]]:
     """Fetch everything from remote. Returns (remote, zones, workers, pages)."""
     remote: ConfigTree = {}
     operations: Resources = {}
+    managedpaths = set() if declaredpaths is None else declaredpaths
 
     logger.info("  fetching zones...")
     if zonelist is None:
@@ -925,7 +935,7 @@ def fetchState(
     logger.info("  fetching zone details...")
     for zone in zones.values():
         logger.info("    %s", zone["name"])
-        fetchZone(client, remote, operations, zone, settingids)
+        fetchZone(client, remote, operations, zone, settingids, managedpaths)
 
     logger.info("  %d zones, %d workers, %d pages", len(zones), len(workers), len(pages))
 
@@ -1080,7 +1090,7 @@ def reconcile(directory: pathlib.Path, configurations: dict[str, dict[str, objec
     observedzones = cast("list[Zone]", paginate(client, "zones"))
     bindZoneIdentities(zones, observedzones)
     zonelist = list(zones.values())
-    remote, remoteresources, zones, workers, pages = fetchState(client, settingids=settingids, zonelist=zonelist)
+    remote, remoteresources, zones, workers, pages = fetchState(client, settingids=settingids, zonelist=zonelist, declaredpaths=set(local))
     reportUnusedDeployments(configurations, workers, pages)
     unknowns = Unknowns(zones)
     fetchDestinationAddresses(client, remote, remoteresources, destinations)
@@ -1089,7 +1099,7 @@ def reconcile(directory: pathlib.Path, configurations: dict[str, dict[str, objec
     applied = reconciliation.runValues(remote, local, dependencies, unknowns, executor, apply=apply, planformat=planformat)
     if applied:
         verifiedzones = [zone for zone in paginate(client, "zones") if str(zone["name"]) in configurations]
-        verified, verifiedresources, verifiedzonemap, _workers, _pages = fetchState(client, settingids=settingids, zonelist=verifiedzones)
+        verified, verifiedresources, verifiedzonemap, _workers, _pages = fetchState(client, settingids=settingids, zonelist=verifiedzones, declaredpaths=set(local))
         fetchDestinationAddresses(client, verified, verifiedresources, destinations)
         reconciliation.verifyConvergence(verified, local, dependencies, Unknowns(verifiedzonemap))
     return zones
