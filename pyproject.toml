@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "functional-configurator"
+version = "0.1.0"
+description = "Declarative infrastructure configuration for Cloudflare, Telnyx, and Regery"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "dnspython==2.8.0",
+    "requests>=2.33,<3",
+]
+
+[project.scripts]
+fconf = "src.main:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.13,<1",
+]
+
+[tool.setuptools]
+packages = ["src"]

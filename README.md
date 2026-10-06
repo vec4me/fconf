@@ -15,14 +15,14 @@ Declarative infrastructure configuration for Cloudflare, Telnyx, and Regery. Exa
 Select the exact provider scope for a plan or application:
 
 ```sh
-./fconf --do cloudflare
-./fconf --do telnyx
-./fconf --do regery
-./fconf --do cloudflare --do regery
-./fconf --do all
-./fconf --do cloudflare --apply
-./fconf --check
-./fconf --do cloudflare --plan=json
+fconf --do cloudflare
+fconf --do telnyx
+fconf --do regery
+fconf --do cloudflare --do regery
+fconf --do all
+fconf --do cloudflare --apply
+fconf --check
+fconf --do cloudflare --plan=json
 ```
 
 Each selected provider prints its plan without mutating remote state. Add `--apply` to perform every planned mutation for the selected providers. Use `--check` to validate all local files without credentials or network access. Regery consumes Cloudflare's authoritative nameserver observations but does not reconcile Cloudflare configuration. Telnyx and Regery declarations live in `examples/telnyx.json` and `examples/regery.json`; Cloudflare relationships are declared directly in zone files. Undeclared remote resources are left untouched.
