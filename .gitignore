@@ -18,7 +18,7 @@
 !/examples/telnyx.json
 !/examples/valgrid.co.zone
 !/examples/vec4me.com.zone
-!/fconf
+!/fconf.py
 !/.gitignore
 !/pyproject.toml
 !/README.md
